@@ -1,9 +1,8 @@
-// index.js
-
 // ---------------- IMPORTS ----------------
+require('dotenv').config();          // load env variables first
 const express = require("express");
 const cors = require("cors");
-const { Pool } = require("pg");
+const { Pool } = require("pg");     // declare Pool only once
 const bcrypt = require("bcrypt");
 
 // ---------------- EXPRESS APP ----------------
@@ -13,11 +12,11 @@ app.use(express.json());
 
 // ---------------- DATABASE CONNECTION ----------------
 const pool = new Pool({
-  host: "aws-1-eu-north-1.pooler.supabase.com",
-  port: 5432,
-  user: "postgres.xgbnbaiucjxsxkwbmoih",
-  password: "Ongeri13754.",
-  database: "postgres",
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
   ssl: { rejectUnauthorized: false },
 });
 
