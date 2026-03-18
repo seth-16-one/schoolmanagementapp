@@ -21,11 +21,11 @@ const pool = new Pool({
 });
 
 // ---------------- ROOT ----------------
-app.get("/", (req, res) => res.send("✅ e-School Backend is running!"));
+app.get("/", (req, res) => res.send("✅ School Management Backend is running!"));
 
 // ===================== AUTH =====================
 
-// Register - Student only, goes to pending
+// ---------------- REGISTER ----------------
 app.post("/register", async (req, res) => {
   const { username, email, password } = req.body;
   if (!username || !email || !password) {
@@ -33,8 +33,10 @@ app.post("/register", async (req, res) => {
   }
 
   try {
+    // Hash the password
     const hashedPassword = await bcrypt.hash(password, 10);
 
+    // Insert into registration table
     const result = await pool.query(
       `INSERT INTO registration (username, email, password, role) 
        VALUES ($1, $2, $3, 'student') 
@@ -46,19 +48,20 @@ app.post("/register", async (req, res) => {
       message: "Registration submitted! Pending admin approval.", 
       registration: result.rows[0] 
     });
+
   } catch (e) {
     console.error("Register Error FULL:", e);
 
-    // Friendly messages
+    // Handle unique username/email
     if (e.code === '23505') {
-      // Unique violation
       return res.status(400).json({ error: "Username or email already exists" });
     }
+
     res.status(500).json({ error: e.message });
   }
 });
 
-// Login - Students & Teachers
+// ---------------- LOGIN (Users: students & teachers) ----------------
 app.post("/login", async (req, res) => {
   const { usernameOrEmail, password } = req.body;
   if (!usernameOrEmail || !password) {
@@ -67,7 +70,7 @@ app.post("/login", async (req, res) => {
 
   try {
     const result = await pool.query(
-      "SELECT * FROM users WHERE username = $1 OR email = $1", 
+      "SELECT * FROM users WHERE username = $1 OR email = $1",
       [usernameOrEmail]
     );
 
@@ -76,31 +79,28 @@ app.post("/login", async (req, res) => {
     }
 
     const user = result.rows[0];
-
-    if (!user.password_hash) {
-      return res.status(500).json({ error: "User password missing" });
-    }
-
     const valid = await bcrypt.compare(password, user.password_hash);
+
     if (!valid) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    res.status(200).json({ 
-      user: { 
-        id: user.id, 
-        username: user.username, 
-        email: user.email, 
-        role: user.role 
-      } 
+    res.status(200).json({
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+      }
     });
+
   } catch (e) {
     console.error("Login Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// Admin Login
+// ---------------- ADMIN LOGIN ----------------
 app.post("/admin-login", async (req, res) => {
   const { usernameOrEmail, password } = req.body;
   if (!usernameOrEmail || !password) {
@@ -109,7 +109,7 @@ app.post("/admin-login", async (req, res) => {
 
   try {
     const result = await pool.query(
-      "SELECT * FROM admins WHERE username = $1 OR email = $1", 
+      "SELECT * FROM admins WHERE username = $1 OR email = $1",
       [usernameOrEmail]
     );
 
@@ -118,24 +118,21 @@ app.post("/admin-login", async (req, res) => {
     }
 
     const admin = result.rows[0];
-
-    if (!admin.password_hash) {
-      return res.status(500).json({ error: "Admin password missing" });
-    }
-
     const valid = await bcrypt.compare(password, admin.password_hash);
+
     if (!valid) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    res.status(200).json({ 
-      user: { 
-        id: admin.id, 
-        username: admin.username, 
-        email: admin.email, 
-        role: "admin" 
-      } 
+    res.status(200).json({
+      user: {
+        id: admin.id,
+        username: admin.username,
+        email: admin.email,
+        role: "admin"
+      }
     });
+
   } catch (e) {
     console.error("Admin Login Error:", e);
     res.status(500).json({ error: e.message });
@@ -169,7 +166,7 @@ app.post("/approve-registration/:id", async (req, res) => {
 
     const user = regResult.rows[0];
 
-    // Insert into users table using password_hash
+    // Insert into users table
     await pool.query(
       "INSERT INTO users (username, email, password_hash, role) VALUES ($1, $2, $3, $4)",
       [user.username, user.email, user.password, user.role || 'student']
@@ -182,8 +179,14 @@ app.post("/approve-registration/:id", async (req, res) => {
     );
 
     res.json({ message: "User approved successfully" });
+
   } catch (e) {
     console.error("Approval Error:", e);
+
+    if (e.code === '23505') {
+      return res.status(400).json({ error: "User already exists in users table" });
+    }
+
     res.status(500).json({ error: e.message });
   }
 });
