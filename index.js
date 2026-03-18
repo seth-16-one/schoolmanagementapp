@@ -47,7 +47,13 @@ app.post("/register", async (req, res) => {
       registration: result.rows[0] 
     });
   } catch (e) {
-    console.error("Register Error:", e);
+    console.error("Register Error FULL:", e);
+
+    // Friendly messages
+    if (e.code === '23505') {
+      // Unique violation
+      return res.status(400).json({ error: "Username or email already exists" });
+    }
     res.status(500).json({ error: e.message });
   }
 });
