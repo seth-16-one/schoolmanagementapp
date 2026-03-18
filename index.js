@@ -21,7 +21,7 @@ const pool = new Pool({
 });
 
 // ---------------- ROOT ----------------
-app.get("/", (req, res) => res.send("✅ School Management Backend is running!"));
+app.get("/", (req, res) => res.send("✅ e-School Backend is running!"));
 
 // ===================== AUTH =====================
 
@@ -34,6 +34,7 @@ app.post("/register", async (req, res) => {
 
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
+
     const result = await pool.query(
       `INSERT INTO registration (username, email, password, role) 
        VALUES ($1, $2, $3, 'student') 
@@ -41,7 +42,7 @@ app.post("/register", async (req, res) => {
       [username, email, hashedPassword]
     );
 
-    res.json({ 
+    res.status(201).json({ 
       message: "Registration submitted! Pending admin approval.", 
       registration: result.rows[0] 
     });
@@ -51,7 +52,7 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// Login
+// Login - Students & Teachers
 app.post("/login", async (req, res) => {
   const { usernameOrEmail, password } = req.body;
   if (!usernameOrEmail || !password) {
@@ -69,14 +70,17 @@ app.post("/login", async (req, res) => {
     }
 
     const user = result.rows[0];
-    const valid = await bcrypt.compare(password, user.password);
 
+    if (!user.password_hash) {
+      return res.status(500).json({ error: "User password missing" });
+    }
+
+    const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    // Return user with role
-    res.json({ 
+    res.status(200).json({ 
       user: { 
         id: user.id, 
         username: user.username, 
@@ -108,13 +112,17 @@ app.post("/admin-login", async (req, res) => {
     }
 
     const admin = result.rows[0];
-    const valid = await bcrypt.compare(password, admin.password);
 
+    if (!admin.password_hash) {
+      return res.status(500).json({ error: "Admin password missing" });
+    }
+
+    const valid = await bcrypt.compare(password, admin.password_hash);
     if (!valid) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    res.json({ 
+    res.status(200).json({ 
       user: { 
         id: admin.id, 
         username: admin.username, 
@@ -144,21 +152,28 @@ app.get("/pending-registrations", async (req, res) => {
 app.post("/approve-registration/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    const regResult = await pool.query("SELECT * FROM registration WHERE id = $1", [id]);
+    const regResult = await pool.query(
+      "SELECT * FROM registration WHERE id = $1", 
+      [id]
+    );
+
     if (regResult.rows.length === 0) {
       return res.status(404).json({ error: "Registration not found" });
     }
 
     const user = regResult.rows[0];
 
-    // Create user in users table
+    // Insert into users table using password_hash
     await pool.query(
       "INSERT INTO users (username, email, password_hash, role) VALUES ($1, $2, $3, $4)",
-      [user.username, user.email, user.password, user.role]
+      [user.username, user.email, user.password, user.role || 'student']
     );
 
-    // Mark as approved
-    await pool.query("UPDATE registration SET approved = true, approved_at = NOW() WHERE id = $1", [id]);
+    // Mark registration as approved
+    await pool.query(
+      "UPDATE registration SET approved = true, approved_at = NOW(), approved_by = (SELECT id FROM admins LIMIT 1) WHERE id = $1",
+      [id]
+    );
 
     res.json({ message: "User approved successfully" });
   } catch (e) {
@@ -180,7 +195,6 @@ app.get("/student-profile/:email", async (req, res) => {
       WHERE s.email = $1`, 
       [email]
     );
-
     res.json(result.rows);
   } catch (e) {
     console.error("Student Profile Error:", e);
