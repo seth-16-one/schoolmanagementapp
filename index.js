@@ -25,7 +25,7 @@ app.get("/", (req, res) => res.send("✅ School Management Backend is running!")
 
 // ===================== AUTH =====================
 
-// ---------------- REGISTER ----------------
+// Register - Only students (parents register separately or via admin)
 app.post("/register", async (req, res) => {
   const { username, email, password } = req.body;
   if (!username || !email || !password) {
@@ -33,35 +33,28 @@ app.post("/register", async (req, res) => {
   }
 
   try {
-    // Hash the password
     const hashedPassword = await bcrypt.hash(password, 10);
-
-    // Insert into registration table
     const result = await pool.query(
-      `INSERT INTO registration (username, email, password, role) 
-       VALUES ($1, $2, $3, 'student') 
+      `INSERT INTO registration (username, email, password, role)
+       VALUES ($1, $2, $3, 'student')
        RETURNING id, username, email, role, approved`,
       [username, email, hashedPassword]
     );
 
-    res.status(201).json({ 
-      message: "Registration submitted! Pending admin approval.", 
-      registration: result.rows[0] 
+    res.status(201).json({
+      message: "Registration submitted! Pending admin approval.",
+      registration: result.rows[0]
     });
-
   } catch (e) {
-    console.error("Register Error FULL:", e);
-
-    // Handle unique username/email
+    console.error("Register Error:", e);
     if (e.code === '23505') {
       return res.status(400).json({ error: "Username or email already exists" });
     }
-
     res.status(500).json({ error: e.message });
   }
 });
 
-// ---------------- LOGIN (Users: students & teachers) ----------------
+// Login - Students & Teachers
 app.post("/login", async (req, res) => {
   const { usernameOrEmail, password } = req.body;
   if (!usernameOrEmail || !password) {
@@ -90,17 +83,16 @@ app.post("/login", async (req, res) => {
         id: user.id,
         username: user.username,
         email: user.email,
-        role: user.role,
+        role: user.role
       }
     });
-
   } catch (e) {
     console.error("Login Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ---------------- ADMIN LOGIN ----------------
+// Admin Login
 app.post("/admin-login", async (req, res) => {
   const { usernameOrEmail, password } = req.body;
   if (!usernameOrEmail || !password) {
@@ -132,11 +124,48 @@ app.post("/admin-login", async (req, res) => {
         role: "admin"
       }
     });
-
   } catch (e) {
     console.error("Admin Login Error:", e);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ===================== PARENT REGISTRATION / LOGIN =====================
+
+// Parent registration (separate endpoint - can be called by admin or self)
+app.post("/parent/register", async (req, res) => {
+  const { username, email, password, full_name, phone } = req.body;
+  if (!username || !email || !password || !full_name) {
+    return res.status(400).json({ error: "Required fields missing" });
+  }
+
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Insert into users
+    const userResult = await pool.query(
+      "INSERT INTO users (username, email, password_hash, role) VALUES ($1, $2, $3, 'parent') RETURNING id",
+      [username, email, hashedPassword]
+    );
+    const userId = userResult.rows[0].id;
+
+    // Insert into parents
+    await pool.query(
+      "INSERT INTO parents (user_id, full_name, phone) VALUES ($1, $2, $3)",
+      [userId, full_name, phone || null]
+    );
+
+    res.status(201).json({ message: "Parent account created successfully" });
+  } catch (e) {
+    console.error("Parent Register Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Parent login (same /login endpoint works - role = 'parent')
+app.post("/parent/login", async (req, res) => {
+  // Reuse the existing /login endpoint - it already handles role 'parent'
+  return app._router.handle(req, res); // Forward to /login
 });
 
 // ===================== PENDING & APPROVAL =====================
@@ -155,38 +184,80 @@ app.get("/pending-registrations", async (req, res) => {
 app.post("/approve-registration/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    const regResult = await pool.query(
-      "SELECT * FROM registration WHERE id = $1", 
-      [id]
-    );
-
+    const regResult = await pool.query("SELECT * FROM registration WHERE id = $1", [id]);
     if (regResult.rows.length === 0) {
       return res.status(404).json({ error: "Registration not found" });
     }
 
-    const user = regResult.rows[0];
+    const reg = regResult.rows[0];
 
-    // Insert into users table
-    await pool.query(
-      "INSERT INTO users (username, email, password_hash, role) VALUES ($1, $2, $3, $4)",
-      [user.username, user.email, user.password, user.role || 'student']
+    // Insert into users
+    const userResult = await pool.query(
+      "INSERT INTO users (username, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id",
+      [reg.username, reg.email, reg.password, reg.role]
     );
+    const userId = userResult.rows[0].id;
 
-    // Mark registration as approved
+    // If role is parent, create parent profile
+    if (reg.role === 'parent') {
+      await pool.query(
+        "INSERT INTO parents (user_id, full_name) VALUES ($1, $2)",
+        [userId, reg.username] // or use full_name if you add it to registration
+      );
+    }
+
+    // Mark approved
     await pool.query(
       "UPDATE registration SET approved = true, approved_at = NOW(), approved_by = (SELECT id FROM admins LIMIT 1) WHERE id = $1",
       [id]
     );
 
     res.json({ message: "User approved successfully" });
-
   } catch (e) {
     console.error("Approval Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
 
-    if (e.code === '23505') {
-      return res.status(400).json({ error: "User already exists in users table" });
-    }
+// ===================== PARENT FEATURES =====================
 
+// Get parent's linked children
+app.get("/parent/children/:parentEmail", async (req, res) => {
+  const { parentEmail } = req.params;
+  try {
+    const result = await pool.query(`
+      SELECT s.full_name, s.class_name, s.admission_number, s.email
+      FROM parent_child pc
+      JOIN parents p ON pc.parent_id = p.id
+      JOIN students s ON pc.student_id = s.id
+      JOIN users u ON p.user_id = u.id
+      WHERE u.email = $1
+    `, [parentEmail]);
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Get Parent Children Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Reuse student endpoints for parent's child data (attendance, results, fees, etc.)
+// Example: parent can call /attendance/:childEmail, /results/:childEmail, etc.
+
+app.get("/parent/messages/:parentEmail", async (req, res) => {
+  const { parentEmail } = req.params;
+  try {
+    const result = await pool.query(`
+      SELECT m.id, m.message, m.sender_role, m.created_at, m.is_read
+      FROM messages m
+      JOIN users u ON m.receiver_id = u.id OR m.sender_id = u.id
+      WHERE u.email = $1
+      ORDER BY m.created_at DESC
+    `, [parentEmail]);
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Parent Messages Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
