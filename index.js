@@ -395,6 +395,149 @@ app.get("/messages/:email", async (req, res) => {
   }
 });
 
+// Teacher marks attendance for a class on a specific date
+app.post("/attendance/mark", async (req, res) => {
+  const { teacherEmail, studentIds, date, statusArray } = req.body; // statusArray = array of 'present'/'absent'/'late'
+
+  if (!teacherEmail || !studentIds || !date || !Array.isArray(statusArray)) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    // Verify teacher exists (optional)
+    const teacher = await pool.query("SELECT id FROM users WHERE email = $1 AND role = 'teacher'", [teacherEmail]);
+    if (teacher.rows.length === 0) return res.status(403).json({ error: "Unauthorized" });
+
+    const results = [];
+    for (let i = 0; i < studentIds.length; i++) {
+      const studentId = studentIds[i];
+      const status = statusArray[i];
+
+      // Upsert (insert or update if already exists for that date)
+      const result = await pool.query(`
+        INSERT INTO attendance (student_id, date, status)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (student_id, date)
+        DO UPDATE SET status = $3
+        RETURNING id, student_id, date, status
+      `, [studentId, date, status]);
+
+      results.push(result.rows[0]);
+    }
+
+    res.status(200).json({ message: "Attendance marked", records: results });
+  } catch (e) {
+    console.error("Mark Attendance Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get attendance for teacher's class on a date (or all recent)
+app.get("/attendance/class/:teacherEmail", async (req, res) => {
+  const { teacherEmail } = req.params;
+  const { date } = req.query; // optional YYYY-MM-DD
+
+  try {
+    let query = `
+      SELECT a.*, s.full_name, s.class_name
+      FROM attendance a
+      JOIN students s ON a.student_id = s.id
+      JOIN teachers t ON s.class_name = t.class_name OR 1=1 -- adjust based on your relation
+      JOIN users u ON t.user_id = u.id
+      WHERE u.email = $1
+    `;
+    const params = [teacherEmail];
+
+    if (date) {
+      query += " AND a.date = $2";
+      params.push(date);
+    }
+
+    query += " ORDER BY a.date DESC, s.full_name";
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Get Class Attendance Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/live-classes/create", async (req, res) => {
+  const { teacherEmail, title, subjectId, className, meetingLink, classTime } = req.body;
+
+  if (!teacherEmail || !title || !meetingLink || !classTime) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    const teacher = await pool.query("SELECT id FROM users WHERE email = $1 AND role = 'teacher'", [teacherEmail]);
+    if (teacher.rows.length === 0) return res.status(403).json({ error: "Unauthorized" });
+
+    const result = await pool.query(
+      `INSERT INTO live_classes (teacher_id, title, subject_id, meeting_link, class_time, class_name)
+       VALUES ((SELECT id FROM teachers WHERE user_id = (SELECT id FROM users WHERE email = $1)), $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [teacherEmail, title, subjectId || null, meetingLink, classTime, className || null]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (e) {
+    console.error("Create Live Class Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/teacher/performance/:teacherEmail", async (req, res) => {
+  const { teacherEmail } = req.params;
+  try {
+    const result = await pool.query(`
+      SELECT s.full_name, s.class_name,
+             AVG(r.marks * 100.0 / NULLIF(e.total_marks, 0)) as average_score
+      FROM students s
+      LEFT JOIN results r ON r.student_id = s.id
+      LEFT JOIN exams e ON r.exam_id = e.id
+      WHERE s.class_name IN (
+        SELECT class_name FROM teachers WHERE user_id = (SELECT id FROM users WHERE email = $1)
+      )
+      GROUP BY s.id, s.full_name, s.class_name
+      ORDER BY average_score DESC
+    `, [teacherEmail]);
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Teacher Performance Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/teacher-profile/:email", async (req, res) => {
+  const { email } = req.params;
+  try {
+    const result = await pool.query(`
+      SELECT t.full_name, t.subject, t.phone, t.profile_picture_url,
+             COUNT(DISTINCT c.id) as total_classes,
+             (SELECT COUNT(DISTINCT s.id) 
+              FROM students s 
+              WHERE s.class_name = t.class_name) as total_students
+      FROM teachers t
+      JOIN users u ON t.user_id = u.id
+      LEFT JOIN classes c ON c.teacher_id = t.id
+      WHERE u.email = $1
+      GROUP BY t.id
+    `, [email]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Teacher not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error("Teacher Profile Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ===================== START SERVER =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
