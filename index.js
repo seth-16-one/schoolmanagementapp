@@ -54,7 +54,7 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// Login - Students & Teachers
+// Login - Students, Teachers, Parents
 app.post("/login", async (req, res) => {
   const { usernameOrEmail, password } = req.body;
   if (!usernameOrEmail || !password) {
@@ -78,12 +78,15 @@ app.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
+    // Ensure role is lowercase for consistency
+    const role = user.role?.toLowerCase() || 'unknown';
+
     res.status(200).json({
       user: {
         id: user.id,
         username: user.username,
         email: user.email,
-        role: user.role
+        role: role  // always lowercase
       }
     });
   } catch (e) {
@@ -92,7 +95,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// Admin Login
+// Admin Login (separate if needed)
 app.post("/admin-login", async (req, res) => {
   const { usernameOrEmail, password } = req.body;
   if (!usernameOrEmail || !password) {
@@ -130,9 +133,9 @@ app.post("/admin-login", async (req, res) => {
   }
 });
 
-// ===================== PARENT REGISTRATION / LOGIN =====================
+// ===================== PARENT REGISTRATION =====================
 
-// Parent registration (separate endpoint - can be called by admin or self)
+// Parent registration (can be called by admin or self)
 app.post("/parent/register", async (req, res) => {
   const { username, email, password, full_name, phone } = req.body;
   if (!username || !email || !password || !full_name) {
@@ -162,12 +165,6 @@ app.post("/parent/register", async (req, res) => {
   }
 });
 
-// Parent login (same /login endpoint works - role = 'parent')
-app.post("/parent/login", async (req, res) => {
-  // Reuse the existing /login endpoint - it already handles role 'parent'
-  return app._router.handle(req, res); // Forward to /login
-});
-
 // ===================== PENDING & APPROVAL =====================
 app.get("/pending-registrations", async (req, res) => {
   try {
@@ -191,18 +188,18 @@ app.post("/approve-registration/:id", async (req, res) => {
 
     const reg = regResult.rows[0];
 
-    // Insert into users
+    // Insert into users with lowercase role
     const userResult = await pool.query(
       "INSERT INTO users (username, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id",
-      [reg.username, reg.email, reg.password, reg.role]
+      [reg.username, reg.email, reg.password, reg.role.toLowerCase()] // ensure lowercase
     );
     const userId = userResult.rows[0].id;
 
     // If role is parent, create parent profile
-    if (reg.role === 'parent') {
+    if (reg.role.toLowerCase() === 'parent') {
       await pool.query(
         "INSERT INTO parents (user_id, full_name) VALUES ($1, $2)",
-        [userId, reg.username] // or use full_name if you add it to registration
+        [userId, reg.username] // use username or add full_name to registration later
       );
     }
 
@@ -242,8 +239,9 @@ app.get("/parent/children/:parentEmail", async (req, res) => {
 });
 
 // Reuse student endpoints for parent's child data (attendance, results, fees, etc.)
-// Example: parent can call /attendance/:childEmail, /results/:childEmail, etc.
+// Parent can call /attendance/:childEmail, /results/:childEmail, /finance/:childEmail, etc.
 
+// Parent messages (messages addressed to parent email)
 app.get("/parent/messages/:parentEmail", async (req, res) => {
   const { parentEmail } = req.params;
   try {
@@ -262,17 +260,17 @@ app.get("/parent/messages/:parentEmail", async (req, res) => {
   }
 });
 
-// ===================== STUDENT PROFILE =====================
+// ===================== STUDENT FEATURES (reused by parent) =====================
 app.get("/student-profile/:email", async (req, res) => {
   const { email } = req.params;
   try {
     const result = await pool.query(`
-      SELECT s.full_name, s.class_name, s.admission_number, s.email, s.phone, 
+      SELECT s.full_name, s.class_name, s.admission_number, s.email, s.phone,
              s.date_of_birth, s.address, s.profile_picture_url,
-             (SELECT COUNT(*) FROM attendance WHERE student_id = s.id AND status = 'present') * 100.0 / 
+             (SELECT COUNT(*) FROM attendance WHERE student_id = s.id AND status = 'present') * 100.0 /
              NULLIF((SELECT COUNT(*) FROM attendance WHERE student_id = s.id), 0) as attendance_percentage
-      FROM students s 
-      WHERE s.email = $1`, 
+      FROM students s
+      WHERE s.email = $1`,
       [email]
     );
     res.json(result.rows);
@@ -282,7 +280,6 @@ app.get("/student-profile/:email", async (req, res) => {
   }
 });
 
-// ===================== STUDENT FEATURES =====================
 app.get("/exams/:studentEmail", async (req, res) => {
   const { studentEmail } = req.params;
   try {
@@ -290,8 +287,8 @@ app.get("/exams/:studentEmail", async (req, res) => {
       SELECT e.* FROM exams e
       JOIN results r ON r.exam_id = e.id
       JOIN students s ON s.id = r.student_id
-      WHERE s.email = $1 
-      ORDER BY e.exam_date DESC`, 
+      WHERE s.email = $1
+      ORDER BY e.exam_date DESC`,
       [studentEmail]
     );
     res.json(result.rows);
@@ -307,7 +304,7 @@ app.get("/results/:studentEmail", async (req, res) => {
     const result = await pool.query(`
       SELECT r.* FROM results r
       JOIN students s ON s.id = r.student_id
-      WHERE s.email = $1`, 
+      WHERE s.email = $1`,
       [studentEmail]
     );
     res.json(result.rows);
@@ -323,7 +320,7 @@ app.get("/finance/:studentEmail", async (req, res) => {
     const result = await pool.query(`
       SELECT f.* FROM finance f
       JOIN students s ON s.id = f.student_id
-      WHERE s.email = $1`, 
+      WHERE s.email = $1`,
       [studentEmail]
     );
     res.json(result.rows);
@@ -339,7 +336,7 @@ app.get("/materials/:studentEmail", async (req, res) => {
     const result = await pool.query(`
       SELECT m.* FROM materials m
       JOIN students s ON s.class_name = m.class_name
-      WHERE s.email = $1`, 
+      WHERE s.email = $1`,
       [studentEmail]
     );
     res.json(result.rows);
@@ -365,8 +362,8 @@ app.get("/attendance/:studentEmail", async (req, res) => {
     const result = await pool.query(`
       SELECT a.* FROM attendance a
       JOIN students s ON s.id = a.student_id
-      WHERE s.email = $1 
-      ORDER BY a.date DESC`, 
+      WHERE s.email = $1
+      ORDER BY a.date DESC`,
       [studentEmail]
     );
     res.json(result.rows);
@@ -376,68 +373,27 @@ app.get("/attendance/:studentEmail", async (req, res) => {
   }
 });
 
-app.get("/messages/:studentEmail", async (req, res) => {
-  const { studentEmail } = req.params;
+app.get("/messages/:email", async (req, res) => {
+  const { email } = req.params;
   try {
-    const studentResult = await pool.query("SELECT id FROM students WHERE email = $1", [studentEmail]);
-    if (studentResult.rows.length === 0) {
-      return res.status(404).json({ error: "Student not found" });
+    const userResult = await pool.query("SELECT id, role FROM users WHERE email = $1", [email]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
     }
-    const studentId = studentResult.rows[0].id;
+    const userId = userResult.rows[0].id;
+    const role = userResult.rows[0].role.toLowerCase();
 
-    const messagesResult = await pool.query(`
+    let query = `
       SELECT m.id, m.message, m.sender_role, m.created_at, m.is_read
       FROM messages m
       WHERE m.receiver_id = $1 OR m.sender_id = $1
-      ORDER BY m.created_at ASC`, 
-      [studentId]
-    );
+      ORDER BY m.created_at DESC
+    `;
+    const result = await pool.query(query, [userId]);
 
-    res.json(messagesResult.rows);
-  } catch (e) {
-    console.error("Messages Error:", e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ===================== PENDING REGISTRATIONS (Admin) =====================
-app.get("/pending-registrations", async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT * FROM registration WHERE approved = false ORDER BY created_at ASC"
-    );
     res.json(result.rows);
   } catch (e) {
-    console.error("Pending Registrations Error:", e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post("/approve-registration/:id", async (req, res) => {
-  const { id } = req.params;
-  try {
-    const regResult = await pool.query("SELECT * FROM registration WHERE id = $1", [id]);
-    if (regResult.rows.length === 0) {
-      return res.status(404).json({ error: "Registration not found" });
-    }
-
-    const user = regResult.rows[0];
-
-    // Create user in users table
-    await pool.query(
-      "INSERT INTO users (username, email, password_hash, role) VALUES ($1, $2, $3, $4)",
-      [user.username, user.email, user.password, user.role]
-    );
-
-    // Mark as approved
-    await pool.query(
-      "UPDATE registration SET approved = true, approved_at = NOW(), approved_by = (SELECT id FROM admins LIMIT 1) WHERE id = $1", 
-      [id]
-    );
-
-    res.json({ message: "User approved successfully" });
-  } catch (e) {
-    console.error("Approval Error:", e);
+    console.error("Messages Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
