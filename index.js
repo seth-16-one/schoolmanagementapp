@@ -538,6 +538,31 @@ app.get("/teacher-profile/:email", async (req, res) => {
   }
 });
 
+app.post("/parent/link-child", async (req, res) => {
+  const { parentId, childIdentifier } = req.body;
+  try {
+    // Find child by email or admission_number
+    const childQuery = await pool.query(
+      "SELECT id FROM students WHERE email = $1 OR admission_number = $1",
+      [childIdentifier]
+    );
+    if (childQuery.rows.length === 0) return res.status(404).json({ error: "Child not found" });
+
+    const childId = childQuery.rows[0].id;
+
+    // Link (assuming parent_child table exists)
+    await pool.query(
+      "INSERT INTO parent_child (parent_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+      [parentId, childId]
+    );
+
+    res.json({ message: "Child linked successfully" });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ===================== START SERVER =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
