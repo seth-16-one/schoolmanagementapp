@@ -25,7 +25,7 @@ app.get("/", (req, res) => res.send("✅ School Management Backend is running!")
 
 // ===================== AUTH =====================
 
-// Register - Only students (parents register separately or via admin)
+// Register - Only students (parents register separately)
 app.post("/register", async (req, res) => {
   const { username, email, password } = req.body;
   if (!username || !email || !password) {
@@ -41,6 +41,7 @@ app.post("/register", async (req, res) => {
       [username, email, hashedPassword]
     );
 
+    console.log(`New student registration: ${email}`);
     res.status(201).json({
       message: "Registration submitted! Pending admin approval.",
       registration: result.rows[0]
@@ -54,7 +55,7 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// Login - Students, Teachers, Parents
+// Login - All roles (student, teacher, parent)
 app.post("/login", async (req, res) => {
   const { usernameOrEmail, password } = req.body;
   if (!usernameOrEmail || !password) {
@@ -62,12 +63,15 @@ app.post("/login", async (req, res) => {
   }
 
   try {
+    console.log(`Login attempt: ${usernameOrEmail}`);
+
     const result = await pool.query(
       "SELECT * FROM users WHERE username = $1 OR email = $1",
       [usernameOrEmail]
     );
 
     if (result.rows.length === 0) {
+      console.log("No user found");
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
@@ -75,11 +79,14 @@ app.post("/login", async (req, res) => {
     const valid = await bcrypt.compare(password, user.password_hash);
 
     if (!valid) {
+      console.log("Password incorrect");
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    // Ensure role is lowercase for consistency
-    const role = user.role?.toLowerCase() || 'unknown';
+    // Force lowercase role
+    const role = (user.role || 'unknown').toLowerCase().trim();
+
+    console.log(`Login success → Email: ${user.email}, Role: ${role}`);
 
     res.status(200).json({
       user: {
@@ -95,7 +102,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// Admin Login (separate if needed)
+// Admin Login
 app.post("/admin-login", async (req, res) => {
   const { usernameOrEmail, password } = req.body;
   if (!usernameOrEmail || !password) {
@@ -134,8 +141,6 @@ app.post("/admin-login", async (req, res) => {
 });
 
 // ===================== PARENT REGISTRATION =====================
-
-// Parent registration (can be called by admin or self)
 app.post("/parent/register", async (req, res) => {
   const { username, email, password, full_name, phone } = req.body;
   if (!username || !email || !password || !full_name) {
@@ -145,19 +150,18 @@ app.post("/parent/register", async (req, res) => {
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Insert into users
     const userResult = await pool.query(
       "INSERT INTO users (username, email, password_hash, role) VALUES ($1, $2, $3, 'parent') RETURNING id",
       [username, email, hashedPassword]
     );
     const userId = userResult.rows[0].id;
 
-    // Insert into parents
     await pool.query(
       "INSERT INTO parents (user_id, full_name, phone) VALUES ($1, $2, $3)",
       [userId, full_name, phone || null]
     );
 
+    console.log(`New parent registered: ${email}`);
     res.status(201).json({ message: "Parent account created successfully" });
   } catch (e) {
     console.error("Parent Register Error:", e);
@@ -187,28 +191,27 @@ app.post("/approve-registration/:id", async (req, res) => {
     }
 
     const reg = regResult.rows[0];
+    const role = (reg.role || 'student').toLowerCase().trim();
 
-    // Insert into users with lowercase role
     const userResult = await pool.query(
       "INSERT INTO users (username, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id",
-      [reg.username, reg.email, reg.password, reg.role.toLowerCase()] // ensure lowercase
+      [reg.username, reg.email, reg.password, role]
     );
     const userId = userResult.rows[0].id;
 
-    // If role is parent, create parent profile
-    if (reg.role.toLowerCase() === 'parent') {
+    if (role === 'parent') {
       await pool.query(
         "INSERT INTO parents (user_id, full_name) VALUES ($1, $2)",
-        [userId, reg.username] // use username or add full_name to registration later
+        [userId, reg.username || 'New Parent']
       );
     }
 
-    // Mark approved
     await pool.query(
       "UPDATE registration SET approved = true, approved_at = NOW(), approved_by = (SELECT id FROM admins LIMIT 1) WHERE id = $1",
       [id]
     );
 
+    console.log(`Approved registration ${id} → Role: ${role}`);
     res.json({ message: "User approved successfully" });
   } catch (e) {
     console.error("Approval Error:", e);
@@ -217,8 +220,6 @@ app.post("/approve-registration/:id", async (req, res) => {
 });
 
 // ===================== PARENT FEATURES =====================
-
-// Get parent's linked children
 app.get("/parent/children/:parentEmail", async (req, res) => {
   const { parentEmail } = req.params;
   try {
@@ -238,10 +239,6 @@ app.get("/parent/children/:parentEmail", async (req, res) => {
   }
 });
 
-// Reuse student endpoints for parent's child data (attendance, results, fees, etc.)
-// Parent can call /attendance/:childEmail, /results/:childEmail, /finance/:childEmail, etc.
-
-// Parent messages (messages addressed to parent email)
 app.get("/parent/messages/:parentEmail", async (req, res) => {
   const { parentEmail } = req.params;
   try {
@@ -260,7 +257,7 @@ app.get("/parent/messages/:parentEmail", async (req, res) => {
   }
 });
 
-// ===================== STUDENT FEATURES (reused by parent) =====================
+// ===================== REUSED STUDENT FEATURES =====================
 app.get("/student-profile/:email", async (req, res) => {
   const { email } = req.params;
   try {
