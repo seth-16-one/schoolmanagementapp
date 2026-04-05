@@ -8,7 +8,8 @@ const { v4: uuidv4 } = require("uuid");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // ---------------- DATABASE CONNECTION ----------------
 const pool = new Pool({
@@ -21,7 +22,14 @@ const pool = new Pool({
 });
 
 // ---------------- ROOT ----------------
-app.get("/", (req, res) => res.send("✅ School Management Backend is running!"));
+app.get("/", (req, res) => res.send("School Management Backend is running!"));
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "school_backend",
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // ===================== AUTH =====================
 
@@ -659,7 +667,7 @@ app.get("/parent/messages/:parentEmail", async (req, res) => {
 
 // ===================== REUSED STUDENT FEATURES =====================
 app.get("/student-profile/:email", async (req, res) => {
-  const { email } = req.params;
+  const email = normalizeEmail(req.params.email);
   try {
     const result = await pool.query(`
       SELECT s.full_name, s.class_name, s.admission_number, u.email, s.phone,
@@ -674,6 +682,105 @@ app.get("/student-profile/:email", async (req, res) => {
     res.json(result.rows);
   } catch (e) {
     console.error("Student Profile Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put("/student-profile/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  const {
+    full_name,
+    gender,
+    date_of_birth,
+    class_name,
+    phone,
+    address,
+    admission_number,
+    profile_picture_url,
+  } = req.body;
+
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: "A valid email address is required" });
+  }
+
+  if (!full_name || !class_name || !admission_number) {
+    return res.status(400).json({
+      error: "Full name, class name, and admission number are required",
+    });
+  }
+
+  try {
+    const userResult = await pool.query(
+      "SELECT id, role FROM users WHERE email = $1 LIMIT 1",
+      [email]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const user = userResult.rows[0];
+    if (user.role !== 'student') {
+      return res.status(403).json({ error: "Only student accounts can update this profile" });
+    }
+
+    const upsertResult = await pool.query(
+      `INSERT INTO students (
+         user_id,
+         admission_number,
+         full_name,
+         gender,
+         date_of_birth,
+         class_name,
+         phone,
+         address,
+         profile_picture_url,
+         updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+       ON CONFLICT (user_id)
+       DO UPDATE SET
+         admission_number = EXCLUDED.admission_number,
+         full_name = EXCLUDED.full_name,
+         gender = EXCLUDED.gender,
+         date_of_birth = EXCLUDED.date_of_birth,
+         class_name = EXCLUDED.class_name,
+         phone = EXCLUDED.phone,
+         address = EXCLUDED.address,
+         profile_picture_url = EXCLUDED.profile_picture_url,
+         updated_at = NOW()
+       RETURNING id`,
+      [
+        user.id,
+        String(admission_number).trim(),
+        String(full_name).trim(),
+        gender ? String(gender).trim() : null,
+        date_of_birth || null,
+        String(class_name).trim(),
+        phone ? String(phone).trim() : null,
+        address ? String(address).trim() : null,
+        profile_picture_url ? String(profile_picture_url).trim() : null,
+      ]
+    );
+
+    const profileResult = await pool.query(`
+      SELECT s.full_name, s.class_name, s.admission_number, u.email, s.phone,
+             s.gender, s.date_of_birth, s.address, s.profile_picture_url,
+             (SELECT COUNT(*) FROM attendance WHERE student_id = s.id AND status = 'present') * 100.0 /
+             NULLIF((SELECT COUNT(*) FROM attendance WHERE student_id = s.id), 0) as attendance_percentage
+      FROM students s
+      JOIN users u ON s.user_id = u.id
+      WHERE s.id = $1
+      LIMIT 1`,
+      [upsertResult.rows[0].id]
+    );
+
+    res.status(200).json(profileResult.rows[0]);
+  } catch (e) {
+    console.error("Update Student Profile Error:", e);
+    if (e.code === '23505') {
+      return res.status(400).json({ error: "Admission number is already in use" });
+    }
     res.status(500).json({ error: e.message });
   }
 });
@@ -777,7 +884,7 @@ app.get("/attendance/:studentEmail", async (req, res) => {
 });
 
 app.get("/messages/:email", async (req, res) => {
-  const { email } = req.params;
+  const email = normalizeEmail(req.params.email);
   try {
     const userResult = await pool.query("SELECT id, role FROM users WHERE email = $1", [email]);
     if (userResult.rows.length === 0) {
@@ -918,7 +1025,7 @@ app.get("/teacher/performance/:teacherEmail", async (req, res) => {
 });
 
 app.get("/teacher-profile/:email", async (req, res) => {
-  const { email } = req.params;
+  const email = normalizeEmail(req.params.email);
   try {
     const result = await pool.query(`
       SELECT t.full_name, t.subject, t.phone, t.profile_picture_url,
@@ -975,8 +1082,9 @@ app.post("/parent/link-child", async (req, res) => {
 // ===================== START SERVER =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ School Management Backend running on port ${PORT}`);
+  console.log(`School Management Backend running on port ${PORT}`);
 });
+
 
 
 
