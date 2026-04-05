@@ -70,23 +70,30 @@ async function loginUserFromUsersTable(usernameOrEmail, password, enforcedRole =
   };
 }
 
-// Register - Only students (parents register separately)
+// Register - Student / Teacher / Parent approval requests
 app.post("/register", async (req, res) => {
-  const { username, email, password } = req.body;
+  const { username, email, password, role } = req.body;
+  const normalizedRole = String(role || "student").toLowerCase().trim();
+  const allowedRoles = new Set(["student", "teacher", "parent"]);
+
   if (!username || !email || !password) {
     return res.status(400).json({ error: "All fields are required" });
+  }
+
+  if (!allowedRoles.has(normalizedRole)) {
+    return res.status(400).json({ error: "Unsupported registration role" });
   }
 
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
       `INSERT INTO registration (username, email, password, role)
-       VALUES ($1, $2, $3, 'student')
+       VALUES ($1, $2, $3, $4)
        RETURNING id, username, email, role, approved`,
-      [username, email, hashedPassword]
+      [username, email, hashedPassword, normalizedRole]
     );
 
-    console.log(`New student registration: ${email}`);
+    console.log(`New ${normalizedRole} registration: ${email}`);
     res.status(201).json({
       message: "Registration submitted! Pending admin approval.",
       registration: result.rows[0]
