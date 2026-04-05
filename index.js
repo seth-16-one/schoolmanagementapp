@@ -25,6 +25,51 @@ app.get("/", (req, res) => res.send("✅ School Management Backend is running!")
 
 // ===================== AUTH =====================
 
+async function loginUserFromUsersTable(usernameOrEmail, password, enforcedRole = null) {
+  const result = await pool.query(
+    "SELECT * FROM users WHERE username = $1 OR email = $1",
+    [usernameOrEmail]
+  );
+
+  if (result.rows.length === 0) {
+    return { status: 401, body: { error: "Invalid credentials" } };
+  }
+
+  const user = result.rows[0];
+  const valid = await bcrypt.compare(password, user.password_hash);
+
+  if (!valid) {
+    return { status: 401, body: { error: "Invalid credentials" } };
+  }
+
+  const role = (user.role || "unknown").toLowerCase().trim();
+  const normalizedExpectedRole = enforcedRole
+    ? String(enforcedRole).toLowerCase().trim()
+    : null;
+
+  if (normalizedExpectedRole && role !== normalizedExpectedRole) {
+    return {
+      status: 403,
+      body: {
+        error: `This app accepts ${normalizedExpectedRole} accounts only`,
+        actualRole: role
+      }
+    };
+  }
+
+  return {
+    status: 200,
+    body: {
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: role
+      }
+    }
+  };
+}
+
 // Register - Only students (parents register separately)
 app.post("/register", async (req, res) => {
   const { username, email, password } = req.body;
@@ -55,49 +100,79 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// Login - All roles (student, teacher, parent)
+// Login - All roles with optional role enforcement
 app.post("/login", async (req, res) => {
-  const { usernameOrEmail, password } = req.body;
+  const { usernameOrEmail, password, expectedRole } = req.body;
   if (!usernameOrEmail || !password) {
     return res.status(400).json({ error: "Username/email and password required" });
   }
 
   try {
     console.log(`Login attempt: ${usernameOrEmail}`);
-
-    const result = await pool.query(
-      "SELECT * FROM users WHERE username = $1 OR email = $1",
-      [usernameOrEmail]
-    );
-
-    if (result.rows.length === 0) {
-      console.log("No user found");
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
-
-    const user = result.rows[0];
-    const valid = await bcrypt.compare(password, user.password_hash);
-
-    if (!valid) {
-      console.log("Password incorrect");
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
-
-    // Force lowercase role
-    const role = (user.role || 'unknown').toLowerCase().trim();
-
-    console.log(`Login success → Email: ${user.email}, Role: ${role}`);
-
-    res.status(200).json({
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        role: role  // always lowercase
-      }
-    });
+    const result = await loginUserFromUsersTable(usernameOrEmail, password, expectedRole);
+    return res.status(result.status).json(result.body);
   } catch (e) {
     console.error("Login Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/student-login", async (req, res) => {
+  const { usernameOrEmail, password } = req.body;
+  if (!usernameOrEmail || !password) {
+    return res.status(400).json({ error: "Username/email and password required" });
+  }
+
+  try {
+    const result = await loginUserFromUsersTable(usernameOrEmail, password, "student");
+    return res.status(result.status).json(result.body);
+  } catch (e) {
+    console.error("Student Login Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/teacher-login", async (req, res) => {
+  const { usernameOrEmail, password } = req.body;
+  if (!usernameOrEmail || !password) {
+    return res.status(400).json({ error: "Username/email and password required" });
+  }
+
+  try {
+    const result = await loginUserFromUsersTable(usernameOrEmail, password, "teacher");
+    return res.status(result.status).json(result.body);
+  } catch (e) {
+    console.error("Teacher Login Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/parent-login", async (req, res) => {
+  const { usernameOrEmail, password } = req.body;
+  if (!usernameOrEmail || !password) {
+    return res.status(400).json({ error: "Username/email and password required" });
+  }
+
+  try {
+    const result = await loginUserFromUsersTable(usernameOrEmail, password, "parent");
+    return res.status(result.status).json(result.body);
+  } catch (e) {
+    console.error("Parent Login Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/finance-login", async (req, res) => {
+  const { usernameOrEmail, password } = req.body;
+  if (!usernameOrEmail || !password) {
+    return res.status(400).json({ error: "Username/email and password required" });
+  }
+
+  try {
+    const result = await loginUserFromUsersTable(usernameOrEmail, password, "finance");
+    return res.status(result.status).json(result.body);
+  } catch (e) {
+    console.error("Finance Login Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -568,3 +643,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ School Management Backend running on port ${PORT}`);
 });
+
+
+
