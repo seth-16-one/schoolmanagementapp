@@ -47,6 +47,45 @@ function isValidEmail(email) {
   return EMAIL_REGEX.test(normalizeEmail(email));
 }
 
+async function markUserPresenceById(userId, isActive = true) {
+  if (!userId) return;
+  await pool.query(
+    `UPDATE users
+     SET last_login = NOW(),
+         is_active = $2
+     WHERE id = $1`,
+    [userId, isActive]
+  );
+}
+
+async function getUserByEmail(email) {
+  const normalizedEmail = normalizeEmail(email);
+  const result = await pool.query(
+    `SELECT id, username, email, role, last_login, is_active
+     FROM users
+     WHERE email = $1
+     LIMIT 1`,
+    [normalizedEmail]
+  );
+  return result.rows[0] || null;
+}
+
+async function ensureAcceptedFriendship(userId, otherUserId) {
+  const result = await pool.query(
+    `SELECT id
+     FROM friend_requests
+     WHERE status = 'accepted'
+       AND (
+         (sender_id = $1 AND receiver_id = $2)
+         OR
+         (sender_id = $2 AND receiver_id = $1)
+       )
+     LIMIT 1`,
+    [userId, otherUserId]
+  );
+  return result.rows.length > 0;
+}
+
 function normalizeOtpChannel(channel) {
   return String(channel || "email").toLowerCase().trim();
 }
@@ -102,6 +141,8 @@ async function authenticateAdminLogin(usernameOrEmail, password) {
   if (!valid) {
     return { status: 401, body: { error: "Invalid credentials" } };
   }
+
+  await markUserPresenceById(adminUser.id, true);
 
   return {
     status: 200,
@@ -274,6 +315,8 @@ async function loginUserFromUsersTable(usernameOrEmail, password, enforcedRole =
       }
     };
   }
+
+  await markUserPresenceById(user.id, true);
 
   return {
     status: 200,
@@ -671,13 +714,15 @@ app.get("/student-profile/:email", async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT s.full_name, s.class_name, s.admission_number, u.email, s.phone,
-             s.date_of_birth, s.address, s.profile_picture_url,
+             s.gender, s.date_of_birth, s.address, s.profile_picture_url,
+             s.profile_locked, s.updated_at,
              (SELECT COUNT(*) FROM attendance WHERE student_id = s.id AND status = 'present') * 100.0 /
              NULLIF((SELECT COUNT(*) FROM attendance WHERE student_id = s.id), 0) as attendance_percentage
       FROM students s
       JOIN users u ON s.user_id = u.id
-      WHERE u.email = $1`,
-      [normalizeEmail(email)]
+      WHERE u.email = $1
+      LIMIT 1`,
+      [email]
     );
     res.json(result.rows);
   } catch (e) {
@@ -710,6 +755,15 @@ app.put("/student-profile/:email", async (req, res) => {
   }
 
   try {
+    const normalizedPicture =
+      typeof profile_picture_url === "string" && profile_picture_url.trim().length > 0
+        ? profile_picture_url.trim()
+        : null;
+    const adminOverrideKey = process.env.ADMIN_PROFILE_OVERRIDE_KEY;
+    const hasAdminOverride =
+      adminOverrideKey &&
+      req.get("x-admin-profile-override") === adminOverrideKey;
+
     const userResult = await pool.query(
       "SELECT id, role FROM users WHERE email = $1 LIMIT 1",
       [email]
@@ -724,6 +778,21 @@ app.put("/student-profile/:email", async (req, res) => {
       return res.status(403).json({ error: "Only student accounts can update this profile" });
     }
 
+    const existingProfile = await pool.query(
+      "SELECT id, profile_locked FROM students WHERE user_id = $1 LIMIT 1",
+      [user.id]
+    );
+
+    if (
+      existingProfile.rows.length > 0 &&
+      existingProfile.rows[0].profile_locked === true &&
+      !hasAdminOverride
+    ) {
+      return res.status(403).json({
+        error: "This student profile is locked. Ask an admin to edit it.",
+      });
+    }
+
     const upsertResult = await pool.query(
       `INSERT INTO students (
          user_id,
@@ -735,9 +804,10 @@ app.put("/student-profile/:email", async (req, res) => {
          phone,
          address,
          profile_picture_url,
+         profile_locked,
          updated_at
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, NOW())
        ON CONFLICT (user_id)
        DO UPDATE SET
          admission_number = EXCLUDED.admission_number,
@@ -748,6 +818,7 @@ app.put("/student-profile/:email", async (req, res) => {
          phone = EXCLUDED.phone,
          address = EXCLUDED.address,
          profile_picture_url = EXCLUDED.profile_picture_url,
+         profile_locked = true,
          updated_at = NOW()
        RETURNING id`,
       [
@@ -759,13 +830,14 @@ app.put("/student-profile/:email", async (req, res) => {
         String(class_name).trim(),
         phone ? String(phone).trim() : null,
         address ? String(address).trim() : null,
-        profile_picture_url ? String(profile_picture_url).trim() : null,
+        normalizedPicture,
       ]
     );
 
     const profileResult = await pool.query(`
       SELECT s.full_name, s.class_name, s.admission_number, u.email, s.phone,
              s.gender, s.date_of_birth, s.address, s.profile_picture_url,
+             s.profile_locked, s.updated_at,
              (SELECT COUNT(*) FROM attendance WHERE student_id = s.id AND status = 'present') * 100.0 /
              NULLIF((SELECT COUNT(*) FROM attendance WHERE student_id = s.id), 0) as attendance_percentage
       FROM students s
@@ -789,10 +861,12 @@ app.get("/exams/:studentEmail", async (req, res) => {
   const { studentEmail } = req.params;
   try {
     const result = await pool.query(`
-      SELECT e.* FROM exams e
+      SELECT e.*, COALESCE(sub.subject_name, 'General') AS subject_name
+      FROM exams e
       JOIN results r ON r.exam_id = e.id
       JOIN students s ON s.id = r.student_id
       JOIN users u ON s.user_id = u.id
+      LEFT JOIN subjects sub ON sub.id = e.subject_id
       WHERE u.email = $1
       ORDER BY e.exam_date DESC`,
       [normalizeEmail(studentEmail)]
@@ -808,10 +882,18 @@ app.get("/results/:studentEmail", async (req, res) => {
   const { studentEmail } = req.params;
   try {
     const result = await pool.query(`
-      SELECT r.* FROM results r
+      SELECT r.*,
+             e.exam_name,
+             e.exam_date,
+             e.total_marks,
+             COALESCE(sub.subject_name, 'General') AS subject_name
+      FROM results r
       JOIN students s ON s.id = r.student_id
       JOIN users u ON s.user_id = u.id
-      WHERE u.email = $1`,
+      LEFT JOIN exams e ON e.id = r.exam_id
+      LEFT JOIN subjects sub ON sub.id = e.subject_id
+      WHERE u.email = $1
+      ORDER BY e.exam_date DESC NULLS LAST, r.created_at DESC`,
       [normalizeEmail(studentEmail)]
     );
     res.json(result.rows);
@@ -828,7 +910,8 @@ app.get("/finance/:studentEmail", async (req, res) => {
       SELECT f.* FROM finance f
       JOIN students s ON s.id = f.student_id
       JOIN users u ON s.user_id = u.id
-      WHERE u.email = $1`,
+      WHERE u.email = $1
+      ORDER BY COALESCE(f.payment_date, f.created_at) DESC`,
       [normalizeEmail(studentEmail)]
     );
     res.json(result.rows);
@@ -842,10 +925,16 @@ app.get("/materials/:studentEmail", async (req, res) => {
   const { studentEmail } = req.params;
   try {
     const result = await pool.query(`
-      SELECT m.* FROM materials m
+      SELECT m.*,
+             COALESCE(t.full_name, 'Teacher') AS teacher_name,
+             COALESCE(sub.subject_name, 'General') AS subject_name
+      FROM materials m
       JOIN students s ON s.class_name = m.class_name
       JOIN users u ON s.user_id = u.id
-      WHERE u.email = $1`,
+      LEFT JOIN teachers t ON t.id = m.teacher_id
+      LEFT JOIN subjects sub ON sub.id = m.subject_id
+      WHERE u.email = $1
+      ORDER BY m.created_at DESC`,
       [normalizeEmail(studentEmail)]
     );
     res.json(result.rows);
@@ -861,6 +950,32 @@ app.get("/live-classes", async (req, res) => {
     res.json(result.rows);
   } catch (e) {
     console.error("Live Classes Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/live-classes/:studentEmail", async (req, res) => {
+  const { studentEmail } = req.params;
+  try {
+    const result = await pool.query(`
+      SELECT lc.*,
+             COALESCE(t.full_name, 'Teacher') AS teacher_name,
+             COALESCE(sub.subject_name, 'General') AS subject_name
+      FROM live_classes lc
+      LEFT JOIN teachers t ON t.id = lc.teacher_id
+      LEFT JOIN subjects sub ON sub.id = lc.subject_id
+      JOIN students s
+        ON lc.class_name IS NULL
+        OR lc.class_name = ''
+        OR s.class_name = lc.class_name
+      JOIN users u ON s.user_id = u.id
+      WHERE u.email = $1
+      ORDER BY lc.class_time DESC`,
+      [normalizeEmail(studentEmail)]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Student Live Classes Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -893,17 +1008,800 @@ app.get("/messages/:email", async (req, res) => {
     const userId = userResult.rows[0].id;
     const role = userResult.rows[0].role.toLowerCase();
 
-    let query = `
-      SELECT m.id, m.message, m.sender_role, m.created_at, m.is_read
-      FROM messages m
-      WHERE m.receiver_id = $1 OR m.sender_id = $1
-      ORDER BY m.created_at DESC
-    `;
-    const result = await pool.query(query, [userId]);
+      const query = `
+        SELECT m.id,
+               m.message,
+               m.sender_role,
+               m.created_at,
+               m.is_read,
+               COALESCE(
+                 CASE WHEN m.sender_id = $1 THEN 'You' ELSE NULL END,
+                 t.full_name,
+                 p.full_name,
+                 a.full_name,
+                 sender_user.username,
+                 sender_user.email,
+                 INITCAP(COALESCE(m.sender_role, 'school'))
+               ) AS sender_name,
+               t.subject AS sender_subject
+        FROM messages m
+        LEFT JOIN users sender_user ON sender_user.id = m.sender_id
+        LEFT JOIN teachers t ON t.user_id = sender_user.id
+        LEFT JOIN parents p ON p.user_id = sender_user.id
+        LEFT JOIN admins a ON a.user_id = sender_user.id
+        WHERE m.receiver_id = $1 OR m.sender_id = $1
+        ORDER BY m.created_at DESC
+      `;
+      const result = await pool.query(query, [userId]);
 
     res.json(result.rows);
   } catch (e) {
     console.error("Messages Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/announcements", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, title, message, priority, created_at
+      FROM announcements
+      ORDER BY created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Announcements Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/presence/ping", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    await markUserPresenceById(user.id, true);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Chat Presence Ping Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/presence/offline", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    await pool.query(
+      `UPDATE users
+       SET is_active = false,
+           last_login = NOW()
+       WHERE id = $1`,
+      [user.id]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Chat Presence Offline Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/chat/discover/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  const search = String(req.query.q || "").trim();
+
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const likeSearch = `%${search}%`;
+    const result = await pool.query(
+      `SELECT u.id,
+              u.email,
+              u.role,
+              u.last_login,
+              COALESCE(s.full_name, t.full_name, p.full_name, a.full_name, u.username, u.email) AS display_name,
+              COALESCE(s.profile_picture_url, t.profile_picture_url, p.profile_picture_url, a.profile_picture_url) AS profile_picture_url,
+              EXISTS (
+                SELECT 1
+                FROM friend_requests fr
+                WHERE fr.status = 'accepted'
+                  AND (
+                    (fr.sender_id = $1 AND fr.receiver_id = u.id)
+                    OR
+                    (fr.sender_id = u.id AND fr.receiver_id = $1)
+                  )
+              ) AS is_friend,
+              (
+                SELECT fr.status
+                FROM friend_requests fr
+                WHERE (
+                  (fr.sender_id = $1 AND fr.receiver_id = u.id)
+                  OR
+                  (fr.sender_id = u.id AND fr.receiver_id = $1)
+                )
+                ORDER BY fr.created_at DESC
+                LIMIT 1
+              ) AS request_status,
+              (
+                SELECT CASE WHEN fr.sender_id = $1 THEN 'outgoing' ELSE 'incoming' END
+                FROM friend_requests fr
+                WHERE (
+                  (fr.sender_id = $1 AND fr.receiver_id = u.id)
+                  OR
+                  (fr.sender_id = u.id AND fr.receiver_id = $1)
+                )
+                ORDER BY fr.created_at DESC
+                LIMIT 1
+              ) AS request_direction,
+              (u.last_login IS NOT NULL AND u.last_login >= NOW() - INTERVAL '5 minutes') AS is_online
+       FROM users u
+       LEFT JOIN students s ON s.user_id = u.id
+       LEFT JOIN teachers t ON t.user_id = u.id
+       LEFT JOIN parents p ON p.user_id = u.id
+       LEFT JOIN admins a ON a.user_id = u.id
+       WHERE u.id <> $1
+         AND (
+           $2 = ''
+           OR u.email ILIKE $3
+           OR u.username ILIKE $3
+           OR COALESCE(s.full_name, t.full_name, p.full_name, a.full_name, '') ILIKE $3
+         )
+       ORDER BY is_online DESC, COALESCE(u.last_login, u.created_at) DESC
+       LIMIT 25`,
+      [user.id, search, likeSearch]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Chat Discover Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/chat/friend-requests/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT fr.id,
+              fr.status,
+              fr.created_at,
+              CASE WHEN fr.receiver_id = $1 THEN 'incoming' ELSE 'outgoing' END AS direction,
+              peer.id AS peer_id,
+              peer.email AS peer_email,
+              peer.role AS peer_role,
+              peer.last_login AS peer_last_login,
+              (peer.last_login IS NOT NULL AND peer.last_login >= NOW() - INTERVAL '5 minutes') AS peer_is_online,
+              COALESCE(s.full_name, t.full_name, p.full_name, a.full_name, peer.username, peer.email) AS peer_name,
+              COALESCE(s.profile_picture_url, t.profile_picture_url, p.profile_picture_url, a.profile_picture_url) AS peer_profile_picture_url
+       FROM friend_requests fr
+       JOIN users peer
+         ON peer.id = CASE WHEN fr.sender_id = $1 THEN fr.receiver_id ELSE fr.sender_id END
+       LEFT JOIN students s ON s.user_id = peer.id
+       LEFT JOIN teachers t ON t.user_id = peer.id
+       LEFT JOIN parents p ON p.user_id = peer.id
+       LEFT JOIN admins a ON a.user_id = peer.id
+       WHERE fr.sender_id = $1 OR fr.receiver_id = $1
+       ORDER BY fr.created_at DESC`,
+      [user.id]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Chat Friend Requests Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/friend-requests", async (req, res) => {
+  const senderEmail = normalizeEmail(req.body.senderEmail);
+  const receiverEmail = normalizeEmail(req.body.receiverEmail);
+
+  try {
+    const sender = await getUserByEmail(senderEmail);
+    const receiver = await getUserByEmail(receiverEmail);
+
+    if (!sender || !receiver) {
+      return res.status(404).json({ error: "Sender or receiver was not found" });
+    }
+
+    if (sender.id === receiver.id) {
+      return res.status(400).json({ error: "You cannot send a friend request to yourself" });
+    }
+
+    const existing = await pool.query(
+      `SELECT id, status
+       FROM friend_requests
+       WHERE (
+         (sender_id = $1 AND receiver_id = $2)
+         OR
+         (sender_id = $2 AND receiver_id = $1)
+       )
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [sender.id, receiver.id]
+    );
+
+    if (existing.rows.length > 0) {
+      const current = existing.rows[0];
+      if (current.status === 'pending') {
+        return res.status(400).json({ error: "A friend request is already pending" });
+      }
+      if (current.status === 'accepted') {
+        return res.status(400).json({ error: "You are already friends" });
+      }
+
+      const refreshed = await pool.query(
+        `UPDATE friend_requests
+         SET sender_id = $1,
+             receiver_id = $2,
+             status = 'pending',
+             created_at = NOW()
+         WHERE id = $3
+         RETURNING *`,
+        [sender.id, receiver.id, current.id]
+      );
+      return res.status(200).json(refreshed.rows[0]);
+    }
+
+    const result = await pool.query(
+      `INSERT INTO friend_requests (sender_id, receiver_id, status)
+       VALUES ($1, $2, 'pending')
+       RETURNING *`,
+      [sender.id, receiver.id]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (e) {
+    console.error("Send Friend Request Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/friend-requests/:id/respond", async (req, res) => {
+  const requestId = req.params.id;
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const action = String(req.body.action || "").toLowerCase().trim();
+
+  if (!['accepted', 'rejected'].includes(action)) {
+    return res.status(400).json({ error: "Action must be accepted or rejected" });
+  }
+
+  try {
+    const actor = await getUserByEmail(actorEmail);
+    if (!actor) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const requestResult = await pool.query(
+      `SELECT *
+       FROM friend_requests
+       WHERE id = $1
+       LIMIT 1`,
+      [requestId]
+    );
+
+    if (requestResult.rows.length === 0) {
+      return res.status(404).json({ error: "Friend request not found" });
+    }
+
+    const requestRow = requestResult.rows[0];
+    if (requestRow.receiver_id !== actor.id) {
+      return res.status(403).json({ error: "Only the receiver can respond to this request" });
+    }
+
+    const updated = await pool.query(
+      `UPDATE friend_requests
+       SET status = $2
+       WHERE id = $1
+       RETURNING *`,
+      [requestId, action]
+    );
+
+    res.json(updated.rows[0]);
+  } catch (e) {
+    console.error("Respond Friend Request Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/chat/contacts/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `WITH contacts AS (
+         SELECT CASE
+                  WHEN fr.sender_id = $1 THEN fr.receiver_id
+                  ELSE fr.sender_id
+                END AS contact_id
+         FROM friend_requests fr
+         WHERE fr.status = 'accepted'
+           AND (fr.sender_id = $1 OR fr.receiver_id = $1)
+       ),
+       latest_message AS (
+         SELECT DISTINCT ON (
+           CASE WHEN m.sender_id = $1 THEN m.receiver_id ELSE m.sender_id END
+         )
+           CASE WHEN m.sender_id = $1 THEN m.receiver_id ELSE m.sender_id END AS contact_id,
+           m.message,
+           m.created_at,
+           m.sender_id,
+           m.is_read,
+           m.read_at,
+           m.delivered_at,
+           m.message_type
+         FROM messages m
+         WHERE m.group_id IS NULL
+           AND (m.sender_id = $1 OR m.receiver_id = $1)
+         ORDER BY CASE WHEN m.sender_id = $1 THEN m.receiver_id ELSE m.sender_id END, m.created_at DESC
+       ),
+       unread AS (
+         SELECT m.sender_id AS contact_id, COUNT(*) AS unread_count
+         FROM messages m
+         WHERE m.group_id IS NULL
+           AND m.receiver_id = $1
+           AND COALESCE(m.is_read, false) = false
+         GROUP BY m.sender_id
+       )
+       SELECT u.id,
+              u.email,
+              u.role,
+              u.last_login,
+              (u.last_login IS NOT NULL AND u.last_login >= NOW() - INTERVAL '5 minutes') AS is_online,
+              COALESCE(s.full_name, t.full_name, p.full_name, a.full_name, u.username, u.email) AS display_name,
+              COALESCE(s.profile_picture_url, t.profile_picture_url, p.profile_picture_url, a.profile_picture_url) AS profile_picture_url,
+              COALESCE(unread.unread_count, 0) AS unread_count,
+              latest_message.message AS last_message,
+              latest_message.created_at AS last_message_at,
+              latest_message.sender_id AS last_message_sender_id,
+              latest_message.is_read AS last_message_is_read,
+              latest_message.read_at AS last_message_read_at,
+              latest_message.delivered_at AS last_message_delivered_at,
+              latest_message.message_type AS last_message_type
+       FROM contacts c
+       JOIN users u ON u.id = c.contact_id
+       LEFT JOIN students s ON s.user_id = u.id
+       LEFT JOIN teachers t ON t.user_id = u.id
+       LEFT JOIN parents p ON p.user_id = u.id
+       LEFT JOIN admins a ON a.user_id = u.id
+       LEFT JOIN latest_message ON latest_message.contact_id = u.id
+       LEFT JOIN unread ON unread.contact_id = u.id
+       ORDER BY COALESCE(latest_message.created_at, u.last_login, u.created_at) DESC`,
+      [user.id]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Chat Contacts Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/chat/thread/:email/:peerEmail", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  const peerEmail = normalizeEmail(req.params.peerEmail);
+  try {
+    const user = await getUserByEmail(email);
+    const peer = await getUserByEmail(peerEmail);
+    if (!user || !peer) {
+      return res.status(404).json({ error: "User was not found" });
+    }
+
+    const canChat = await ensureAcceptedFriendship(user.id, peer.id);
+    if (!canChat) {
+      return res.status(403).json({ error: "You must be friends before chatting" });
+    }
+
+    await pool.query(
+      `UPDATE messages
+       SET delivered_at = COALESCE(delivered_at, NOW())
+       WHERE group_id IS NULL
+         AND sender_id = $2
+         AND receiver_id = $1`,
+      [user.id, peer.id]
+    );
+
+    const result = await pool.query(
+      `SELECT m.id,
+              m.sender_id,
+              m.receiver_id,
+              sender_user.email AS sender_email,
+              m.message,
+              m.sender_role,
+              m.created_at,
+              m.is_read,
+              m.delivered_at,
+              m.read_at,
+              m.message_type,
+              m.media_url,
+              m.thumbnail_url,
+               m.duration_seconds,
+               m.client_message_id
+       FROM messages m
+       JOIN users sender_user ON sender_user.id = m.sender_id
+       WHERE m.group_id IS NULL
+         AND (
+           (m.sender_id = $1 AND m.receiver_id = $2)
+           OR
+           (m.sender_id = $2 AND m.receiver_id = $1)
+         )
+       ORDER BY m.created_at ASC`,
+      [user.id, peer.id]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Chat Thread Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/thread/send", async (req, res) => {
+  const senderEmail = normalizeEmail(req.body.senderEmail);
+  const receiverEmail = normalizeEmail(req.body.receiverEmail);
+  const message = String(req.body.message || "");
+  const messageType = String(req.body.messageType || "text").trim().toLowerCase();
+  const mediaUrl = req.body.mediaUrl || null;
+  const thumbnailUrl = req.body.thumbnailUrl || null;
+  const durationSeconds = req.body.durationSeconds || null;
+  const clientMessageId = req.body.clientMessageId || null;
+
+  try {
+    const sender = await getUserByEmail(senderEmail);
+    const receiver = await getUserByEmail(receiverEmail);
+    if (!sender || !receiver) {
+      return res.status(404).json({ error: "Sender or receiver was not found" });
+    }
+
+    const canChat = await ensureAcceptedFriendship(sender.id, receiver.id);
+    if (!canChat) {
+      return res.status(403).json({ error: "You must be friends before chatting" });
+    }
+
+    if (!message.trim() && !mediaUrl) {
+      return res.status(400).json({ error: "Message text or media is required" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO messages (
+         sender_id,
+         receiver_id,
+         message,
+         is_read,
+         sender_role,
+         message_type,
+         media_url,
+         thumbnail_url,
+         duration_seconds,
+         client_message_id
+       )
+       VALUES ($1, $2, $3, false, $4, $5, $6, $7, $8, $9)
+       RETURNING id, sender_id, receiver_id, message, sender_role, created_at, is_read,
+                 delivered_at, read_at, message_type, media_url, thumbnail_url,
+                 duration_seconds, client_message_id`,
+      [
+        sender.id,
+        receiver.id,
+        message.trim(),
+        sender.role,
+        messageType,
+        mediaUrl,
+        thumbnailUrl,
+        durationSeconds,
+        clientMessageId,
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (e) {
+    console.error("Send Chat Message Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/thread/read", async (req, res) => {
+  const readerEmail = normalizeEmail(req.body.readerEmail);
+  const peerEmail = normalizeEmail(req.body.peerEmail);
+  try {
+    const reader = await getUserByEmail(readerEmail);
+    const peer = await getUserByEmail(peerEmail);
+    if (!reader || !peer) {
+      return res.status(404).json({ error: "Reader or peer was not found" });
+    }
+
+    const canChat = await ensureAcceptedFriendship(reader.id, peer.id);
+    if (!canChat) {
+      return res.status(403).json({ error: "You must be friends before chatting" });
+    }
+
+    await pool.query(
+      `UPDATE messages
+       SET delivered_at = COALESCE(delivered_at, NOW()),
+           is_read = true,
+           read_at = NOW()
+       WHERE group_id IS NULL
+         AND sender_id = $2
+         AND receiver_id = $1`,
+      [reader.id, peer.id]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Read Chat Thread Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/chat/groups/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT g.id,
+              g.name,
+              g.avatar_url,
+              g.created_at,
+              COUNT(DISTINCT members.user_id) AS member_count,
+              MAX(m.created_at) AS last_message_at
+       FROM chat_groups g
+       JOIN chat_group_members gm ON gm.group_id = g.id
+       LEFT JOIN chat_group_members members ON members.group_id = g.id
+       LEFT JOIN messages m ON m.group_id = g.id
+       WHERE gm.user_id = $1
+       GROUP BY g.id
+       ORDER BY COALESCE(MAX(m.created_at), g.created_at) DESC`,
+      [user.id]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Chat Groups Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/groups", async (req, res) => {
+  const creatorEmail = normalizeEmail(req.body.creatorEmail);
+  const name = String(req.body.name || "").trim();
+  const avatarUrl = req.body.avatarUrl || null;
+  const memberEmails = Array.isArray(req.body.memberEmails) ? req.body.memberEmails : [];
+
+  if (!name) {
+    return res.status(400).json({ error: "Group name is required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const creator = await getUserByEmail(creatorEmail);
+    if (!creator) {
+      return res.status(404).json({ error: "Creator not found" });
+    }
+
+    const normalizedEmails = [...new Set([creatorEmail, ...memberEmails.map(normalizeEmail)])];
+    const memberResult = await client.query(
+      `SELECT id, email
+       FROM users
+       WHERE email = ANY($1)`,
+      [normalizedEmails]
+    );
+
+    await client.query("BEGIN");
+    const groupResult = await client.query(
+      `INSERT INTO chat_groups (name, created_by, avatar_url)
+       VALUES ($1, $2, $3)
+       RETURNING *`,
+      [name, creator.id, avatarUrl]
+    );
+    const group = groupResult.rows[0];
+
+    for (const member of memberResult.rows) {
+      await client.query(
+        `INSERT INTO chat_group_members (group_id, user_id, is_admin)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (group_id, user_id) DO NOTHING`,
+        [group.id, member.id, member.id === creator.id]
+      );
+    }
+    await client.query("COMMIT");
+
+    res.status(201).json(group);
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Create Chat Group Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/chat/groups/:groupId/add-members", async (req, res) => {
+  const groupId = req.params.groupId;
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const memberEmails = Array.isArray(req.body.memberEmails) ? req.body.memberEmails : [];
+
+  const client = await pool.connect();
+  try {
+    const actor = await getUserByEmail(actorEmail);
+    if (!actor) {
+      return res.status(404).json({ error: "Actor not found" });
+    }
+
+    const membership = await client.query(
+      `SELECT id
+       FROM chat_group_members
+       WHERE group_id = $1
+         AND user_id = $2
+         AND is_admin = true
+       LIMIT 1`,
+      [groupId, actor.id]
+    );
+    if (membership.rows.length === 0) {
+      return res.status(403).json({ error: "Only a group admin can add members" });
+    }
+
+    const normalizedEmails = [...new Set(memberEmails.map(normalizeEmail))];
+    const members = await client.query(
+      `SELECT id
+       FROM users
+       WHERE email = ANY($1)`,
+      [normalizedEmails]
+    );
+
+    for (const member of members.rows) {
+      await client.query(
+        `INSERT INTO chat_group_members (group_id, user_id, is_admin)
+         VALUES ($1, $2, false)
+         ON CONFLICT (group_id, user_id) DO NOTHING`,
+        [groupId, member.id]
+      );
+    }
+
+    res.json({ ok: true, added: members.rows.length });
+  } catch (e) {
+    console.error("Add Group Members Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/chat/groups/:groupId/messages/:email", async (req, res) => {
+  const groupId = req.params.groupId;
+  const email = normalizeEmail(req.params.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const membership = await pool.query(
+      `SELECT id
+       FROM chat_group_members
+       WHERE group_id = $1 AND user_id = $2
+       LIMIT 1`,
+      [groupId, user.id]
+    );
+    if (membership.rows.length === 0) {
+      return res.status(403).json({ error: "You are not a member of this group" });
+    }
+
+    const result = await pool.query(
+      `SELECT m.id,
+              m.group_id,
+              m.sender_id,
+              u.email AS sender_email,
+              m.message,
+              m.sender_role,
+              m.created_at,
+              m.message_type,
+              m.media_url,
+              m.thumbnail_url,
+              m.duration_seconds,
+              m.client_message_id,
+              COALESCE(s.full_name, t.full_name, p.full_name, a.full_name, u.username, u.email) AS sender_name
+       FROM messages m
+       JOIN users u ON u.id = m.sender_id
+       LEFT JOIN students s ON s.user_id = u.id
+       LEFT JOIN teachers t ON t.user_id = u.id
+       LEFT JOIN parents p ON p.user_id = u.id
+       LEFT JOIN admins a ON a.user_id = u.id
+       WHERE m.group_id = $1
+       ORDER BY m.created_at ASC`,
+      [groupId]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Get Group Messages Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/groups/:groupId/messages", async (req, res) => {
+  const groupId = req.params.groupId;
+  const senderEmail = normalizeEmail(req.body.senderEmail);
+  const message = String(req.body.message || "");
+  const messageType = String(req.body.messageType || "text").trim().toLowerCase();
+  const mediaUrl = req.body.mediaUrl || null;
+  const thumbnailUrl = req.body.thumbnailUrl || null;
+  const durationSeconds = req.body.durationSeconds || null;
+  const clientMessageId = req.body.clientMessageId || null;
+
+  try {
+    const sender = await getUserByEmail(senderEmail);
+    if (!sender) {
+      return res.status(404).json({ error: "Sender not found" });
+    }
+
+    const membership = await pool.query(
+      `SELECT id
+       FROM chat_group_members
+       WHERE group_id = $1 AND user_id = $2
+       LIMIT 1`,
+      [groupId, sender.id]
+    );
+    if (membership.rows.length === 0) {
+      return res.status(403).json({ error: "You are not a member of this group" });
+    }
+
+    if (!message.trim() && !mediaUrl) {
+      return res.status(400).json({ error: "Message text or media is required" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO messages (
+         sender_id,
+         receiver_id,
+         group_id,
+         message,
+         is_read,
+         sender_role,
+         message_type,
+         media_url,
+         thumbnail_url,
+         duration_seconds,
+         client_message_id
+       )
+       VALUES ($1, NULL, $2, $3, false, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [
+        sender.id,
+        groupId,
+        message.trim(),
+        sender.role,
+        messageType,
+        mediaUrl,
+        thumbnailUrl,
+        durationSeconds,
+        clientMessageId,
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (e) {
+    console.error("Send Group Message Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
