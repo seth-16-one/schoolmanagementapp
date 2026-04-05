@@ -25,6 +25,216 @@ app.get("/", (req, res) => res.send("✅ School Management Backend is running!")
 
 // ===================== AUTH =====================
 
+const otpChallenges = new Map();
+const OTP_EXPIRY_MS = Number(process.env.OTP_EXPIRY_MS || 10 * 60 * 1000);
+const OTP_MAX_ATTEMPTS = Number(process.env.OTP_MAX_ATTEMPTS || 5);
+const OTP_DEV_PREVIEW = process.env.OTP_DEV_PREVIEW !== "false";
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function isValidEmail(email) {
+  return EMAIL_REGEX.test(normalizeEmail(email));
+}
+
+function normalizeOtpChannel(channel) {
+  return String(channel || "email").toLowerCase().trim();
+}
+
+function cleanupExpiredOtpChallenges() {
+  const now = Date.now();
+  for (const [challengeId, challenge] of otpChallenges.entries()) {
+    if (challenge.expiresAt <= now) {
+      otpChallenges.delete(challengeId);
+    }
+  }
+}
+
+function generateOtpCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function maskValue(value, type = "email") {
+  if (!value) return null;
+
+  if (type === "phone") {
+    const digits = String(value).replace(/\D/g, "");
+    if (digits.length <= 4) return `••${digits}`;
+    return `••••${digits.slice(-4)}`;
+  }
+
+  const [localPart, domain = ""] = String(value).split("@");
+  if (!domain) return "••••";
+
+  const visibleLocal = localPart.length <= 2
+    ? `${localPart[0] || ""}•`
+    : `${localPart.slice(0, 2)}•••`;
+  return `${visibleLocal}@${domain}`;
+}
+
+async function authenticateAdminLogin(usernameOrEmail, password) {
+  const result = await pool.query(
+    `SELECT u.id, u.username, u.email, u.password_hash, u.role
+     FROM users u
+     LEFT JOIN admins a ON a.user_id = u.id
+     WHERE (u.username = $1 OR u.email = $1) AND u.role = 'admin'
+     LIMIT 1`,
+    [usernameOrEmail]
+  );
+
+  if (result.rows.length === 0) {
+    return { status: 401, body: { error: "Invalid credentials" } };
+  }
+
+  const adminUser = result.rows[0];
+  const valid = await bcrypt.compare(password, adminUser.password_hash);
+
+  if (!valid) {
+    return { status: 401, body: { error: "Invalid credentials" } };
+  }
+
+  return {
+    status: 200,
+    body: {
+      user: {
+        id: adminUser.id,
+        username: adminUser.username,
+        email: adminUser.email,
+        role: "admin"
+      }
+    }
+  };
+}
+
+async function authenticateLoginAttempt(usernameOrEmail, password, expectedRole = null) {
+  const normalizedExpectedRole = expectedRole
+    ? String(expectedRole).toLowerCase().trim()
+    : null;
+
+  if (normalizedExpectedRole === "admin") {
+    return authenticateAdminLogin(usernameOrEmail, password);
+  }
+
+  return loginUserFromUsersTable(usernameOrEmail, password, normalizedExpectedRole);
+}
+
+async function resolveOtpDestinations(user) {
+  const destinations = {};
+  if (user.email) {
+    destinations.email = user.email;
+  }
+
+  try {
+    if (user.role === "student") {
+      const result = await pool.query(
+        `SELECT s.phone
+         FROM students s
+         JOIN users u ON s.user_id = u.id
+         WHERE u.email = $1
+         LIMIT 1`,
+        [user.email]
+      );
+      const phone = result.rows[0]?.phone;
+      if (phone) destinations.sms = phone;
+    }
+
+    if (user.role === "teacher") {
+      const result = await pool.query(
+        `SELECT t.phone
+         FROM teachers t
+         JOIN users u ON t.user_id = u.id
+         WHERE u.email = $1
+         LIMIT 1`,
+        [user.email]
+      );
+      const phone = result.rows[0]?.phone;
+      if (phone) destinations.sms = phone;
+    }
+
+    if (user.role === "parent") {
+      const result = await pool.query(
+        `SELECT p.phone
+         FROM parents p
+         JOIN users u ON p.user_id = u.id
+         WHERE u.email = $1
+         LIMIT 1`,
+        [user.email]
+      );
+      const phone = result.rows[0]?.phone;
+      if (phone) destinations.sms = phone;
+    }
+
+    if (user.role === "admin") {
+      const result = await pool.query(
+        `SELECT a.phone
+         FROM admins a
+         JOIN users u ON a.user_id = u.id
+         WHERE u.email = $1
+         LIMIT 1`,
+        [user.email]
+      );
+      const phone = result.rows[0]?.phone;
+      if (phone) destinations.sms = phone;
+    }
+  } catch (e) {
+    console.error("Resolve OTP destinations error:", e);
+  }
+
+  return destinations;
+}
+
+function getOtpWebhookUrl(channel) {
+  if (channel === "sms") {
+    return process.env.OTP_SMS_WEBHOOK_URL || process.env.OTP_WEBHOOK_URL || null;
+  }
+  return process.env.OTP_EMAIL_WEBHOOK_URL || process.env.OTP_WEBHOOK_URL || null;
+}
+
+async function deliverOtp({ user, channel, destination, code }) {
+  const webhookUrl = getOtpWebhookUrl(channel);
+  const message = `Your eSchool verification code is ${code}. It expires in 10 minutes.`;
+
+  if (webhookUrl) {
+    try {
+      const response = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channel,
+          destination,
+          code,
+          message,
+          user: {
+            id: user.id,
+            email: user.email,
+            role: user.role,
+            username: user.username
+          }
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Webhook responded with ${response.status}`);
+      }
+
+      return {
+        deliveryMode: "webhook",
+        previewCode: null
+      };
+    } catch (e) {
+      console.error(`OTP ${channel} webhook failed:`, e);
+    }
+  }
+
+  console.log(`[OTP ${channel.toUpperCase()}] ${destination} => ${code}`);
+  return {
+    deliveryMode: "preview",
+    previewCode: OTP_DEV_PREVIEW ? code : null
+  };
+}
+
 async function loginUserFromUsersTable(usernameOrEmail, password, enforcedRole = null) {
   const result = await pool.query(
     "SELECT * FROM users WHERE username = $1 OR email = $1",
@@ -73,11 +283,16 @@ async function loginUserFromUsersTable(usernameOrEmail, password, enforcedRole =
 // Register - Student / Teacher / Parent approval requests
 app.post("/register", async (req, res) => {
   const { username, email, password, role } = req.body;
+  const normalizedEmail = normalizeEmail(email);
   const normalizedRole = String(role || "student").toLowerCase().trim();
   const allowedRoles = new Set(["student", "teacher", "parent"]);
 
   if (!username || !email || !password) {
     return res.status(400).json({ error: "All fields are required" });
+  }
+
+  if (!isValidEmail(normalizedEmail)) {
+    return res.status(400).json({ error: "A valid email address is required" });
   }
 
   if (!allowedRoles.has(normalizedRole)) {
@@ -90,10 +305,10 @@ app.post("/register", async (req, res) => {
       `INSERT INTO registration (username, email, password, role)
        VALUES ($1, $2, $3, $4)
        RETURNING id, username, email, role, approved`,
-      [username, email, hashedPassword, normalizedRole]
+      [username, normalizedEmail, hashedPassword, normalizedRole]
     );
 
-    console.log(`New ${normalizedRole} registration: ${email}`);
+    console.log(`New ${normalizedRole} registration: ${normalizedEmail}`);
     res.status(201).json({
       message: "Registration submitted! Pending admin approval.",
       registration: result.rows[0]
@@ -184,6 +399,125 @@ app.post("/finance-login", async (req, res) => {
   }
 });
 
+app.post("/login-otp/request", async (req, res) => {
+  const {
+    usernameOrEmail,
+    password,
+    expectedRole,
+    channel,
+  } = req.body;
+
+  if (!usernameOrEmail || !password) {
+    return res.status(400).json({ error: "Username/email and password required" });
+  }
+
+  cleanupExpiredOtpChallenges();
+
+  try {
+    const authResult = await authenticateLoginAttempt(usernameOrEmail, password, expectedRole);
+    if (authResult.status !== 200) {
+      return res.status(authResult.status).json(authResult.body);
+    }
+
+    const user = authResult.body.user;
+    const requestedChannel = normalizeOtpChannel(channel);
+    const destinations = await resolveOtpDestinations(user);
+    const availableChannels = Object.keys(destinations);
+
+    if (!availableChannels.length) {
+      return res.status(400).json({
+        error: "No OTP delivery destination is configured for this account",
+      });
+    }
+
+    if (!destinations[requestedChannel]) {
+      return res.status(400).json({
+        error: `${requestedChannel.toUpperCase()} OTP is not available for this account`,
+        availableChannels,
+        maskedDestinations: {
+          email: maskValue(destinations.email, "email"),
+          sms: maskValue(destinations.sms, "phone"),
+        }
+      });
+    }
+
+    const challengeId = uuidv4();
+    const code = generateOtpCode();
+    const expiresAt = Date.now() + OTP_EXPIRY_MS;
+    const destination = destinations[requestedChannel];
+    const delivery = await deliverOtp({
+      user,
+      channel: requestedChannel,
+      destination,
+      code,
+    });
+
+    otpChallenges.set(challengeId, {
+      attempts: 0,
+      code,
+      user,
+      channel: requestedChannel,
+      expiresAt,
+    });
+
+    return res.status(200).json({
+      challengeId,
+      channel: requestedChannel,
+      destinationMasked: maskValue(
+        destination,
+        requestedChannel === "sms" ? "phone" : "email"
+      ),
+      availableChannels,
+      maskedDestinations: {
+        email: maskValue(destinations.email, "email"),
+        sms: maskValue(destinations.sms, "phone"),
+      },
+      expiresAt: new Date(expiresAt).toISOString(),
+      deliveryMode: delivery.deliveryMode,
+      previewCode: delivery.previewCode,
+    });
+  } catch (e) {
+    console.error("Login OTP Request Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/login-otp/verify", async (req, res) => {
+  const { challengeId, code } = req.body;
+
+  if (!challengeId || !code) {
+    return res.status(400).json({ error: "Challenge ID and verification code required" });
+  }
+
+  cleanupExpiredOtpChallenges();
+  const challenge = otpChallenges.get(challengeId);
+
+  if (!challenge) {
+    return res.status(404).json({ error: "OTP challenge expired or was not found" });
+  }
+
+  if (challenge.expiresAt <= Date.now()) {
+    otpChallenges.delete(challengeId);
+    return res.status(410).json({ error: "OTP challenge has expired" });
+  }
+
+  challenge.attempts += 1;
+  if (String(code).trim() !== challenge.code) {
+    if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
+      otpChallenges.delete(challengeId);
+      return res.status(429).json({ error: "Too many incorrect verification attempts" });
+    }
+
+    return res.status(401).json({
+      error: "Invalid verification code",
+      remainingAttempts: OTP_MAX_ATTEMPTS - challenge.attempts,
+    });
+  }
+
+  otpChallenges.delete(challengeId);
+  return res.status(200).json({ user: challenge.user });
+});
+
 // Admin Login
 app.post("/admin-login", async (req, res) => {
   const { usernameOrEmail, password } = req.body;
@@ -192,30 +526,8 @@ app.post("/admin-login", async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      "SELECT * FROM admins WHERE username = $1 OR email = $1",
-      [usernameOrEmail]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
-
-    const admin = result.rows[0];
-    const valid = await bcrypt.compare(password, admin.password_hash);
-
-    if (!valid) {
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
-
-    res.status(200).json({
-      user: {
-        id: admin.id,
-        username: admin.username,
-        email: admin.email,
-        role: "admin"
-      }
-    });
+    const result = await authenticateAdminLogin(usernameOrEmail, password);
+    res.status(result.status).json(result.body);
   } catch (e) {
     console.error("Admin Login Error:", e);
     res.status(500).json({ error: e.message });
@@ -225,8 +537,13 @@ app.post("/admin-login", async (req, res) => {
 // ===================== PARENT REGISTRATION =====================
 app.post("/parent/register", async (req, res) => {
   const { username, email, password, full_name, phone } = req.body;
+  const normalizedEmail = normalizeEmail(email);
   if (!username || !email || !password || !full_name) {
     return res.status(400).json({ error: "Required fields missing" });
+  }
+
+  if (!isValidEmail(normalizedEmail)) {
+    return res.status(400).json({ error: "A valid email address is required" });
   }
 
   try {
@@ -234,7 +551,7 @@ app.post("/parent/register", async (req, res) => {
 
     const userResult = await pool.query(
       "INSERT INTO users (username, email, password_hash, role) VALUES ($1, $2, $3, 'parent') RETURNING id",
-      [username, email, hashedPassword]
+      [username, normalizedEmail, hashedPassword]
     );
     const userId = userResult.rows[0].id;
 
@@ -243,7 +560,7 @@ app.post("/parent/register", async (req, res) => {
       [userId, full_name, phone || null]
     );
 
-    console.log(`New parent registered: ${email}`);
+    console.log(`New parent registered: ${normalizedEmail}`);
     res.status(201).json({ message: "Parent account created successfully" });
   } catch (e) {
     console.error("Parent Register Error:", e);
@@ -306,13 +623,14 @@ app.get("/parent/children/:parentEmail", async (req, res) => {
   const { parentEmail } = req.params;
   try {
     const result = await pool.query(`
-      SELECT s.full_name, s.class_name, s.admission_number, s.email
+      SELECT s.full_name, s.class_name, s.admission_number, child_user.email
       FROM parent_child pc
       JOIN parents p ON pc.parent_id = p.id
       JOIN students s ON pc.student_id = s.id
       JOIN users u ON p.user_id = u.id
+      LEFT JOIN users child_user ON child_user.id = s.user_id
       WHERE u.email = $1
-    `, [parentEmail]);
+    `, [normalizeEmail(parentEmail)]);
 
     res.json(result.rows);
   } catch (e) {
@@ -344,13 +662,14 @@ app.get("/student-profile/:email", async (req, res) => {
   const { email } = req.params;
   try {
     const result = await pool.query(`
-      SELECT s.full_name, s.class_name, s.admission_number, s.email, s.phone,
+      SELECT s.full_name, s.class_name, s.admission_number, u.email, s.phone,
              s.date_of_birth, s.address, s.profile_picture_url,
              (SELECT COUNT(*) FROM attendance WHERE student_id = s.id AND status = 'present') * 100.0 /
              NULLIF((SELECT COUNT(*) FROM attendance WHERE student_id = s.id), 0) as attendance_percentage
       FROM students s
-      WHERE s.email = $1`,
-      [email]
+      JOIN users u ON s.user_id = u.id
+      WHERE u.email = $1`,
+      [normalizeEmail(email)]
     );
     res.json(result.rows);
   } catch (e) {
@@ -366,9 +685,10 @@ app.get("/exams/:studentEmail", async (req, res) => {
       SELECT e.* FROM exams e
       JOIN results r ON r.exam_id = e.id
       JOIN students s ON s.id = r.student_id
-      WHERE s.email = $1
+      JOIN users u ON s.user_id = u.id
+      WHERE u.email = $1
       ORDER BY e.exam_date DESC`,
-      [studentEmail]
+      [normalizeEmail(studentEmail)]
     );
     res.json(result.rows);
   } catch (e) {
@@ -383,8 +703,9 @@ app.get("/results/:studentEmail", async (req, res) => {
     const result = await pool.query(`
       SELECT r.* FROM results r
       JOIN students s ON s.id = r.student_id
-      WHERE s.email = $1`,
-      [studentEmail]
+      JOIN users u ON s.user_id = u.id
+      WHERE u.email = $1`,
+      [normalizeEmail(studentEmail)]
     );
     res.json(result.rows);
   } catch (e) {
@@ -399,8 +720,9 @@ app.get("/finance/:studentEmail", async (req, res) => {
     const result = await pool.query(`
       SELECT f.* FROM finance f
       JOIN students s ON s.id = f.student_id
-      WHERE s.email = $1`,
-      [studentEmail]
+      JOIN users u ON s.user_id = u.id
+      WHERE u.email = $1`,
+      [normalizeEmail(studentEmail)]
     );
     res.json(result.rows);
   } catch (e) {
@@ -415,8 +737,9 @@ app.get("/materials/:studentEmail", async (req, res) => {
     const result = await pool.query(`
       SELECT m.* FROM materials m
       JOIN students s ON s.class_name = m.class_name
-      WHERE s.email = $1`,
-      [studentEmail]
+      JOIN users u ON s.user_id = u.id
+      WHERE u.email = $1`,
+      [normalizeEmail(studentEmail)]
     );
     res.json(result.rows);
   } catch (e) {
@@ -441,9 +764,10 @@ app.get("/attendance/:studentEmail", async (req, res) => {
     const result = await pool.query(`
       SELECT a.* FROM attendance a
       JOIN students s ON s.id = a.student_id
-      WHERE s.email = $1
+      JOIN users u ON s.user_id = u.id
+      WHERE u.email = $1
       ORDER BY a.date DESC`,
-      [studentEmail]
+      [normalizeEmail(studentEmail)]
     );
     res.json(result.rows);
   } catch (e) {
@@ -625,8 +949,11 @@ app.post("/parent/link-child", async (req, res) => {
   try {
     // Find child by email or admission_number
     const childQuery = await pool.query(
-      "SELECT id FROM students WHERE email = $1 OR admission_number = $1",
-      [childIdentifier]
+      `SELECT s.id
+       FROM students s
+       LEFT JOIN users u ON s.user_id = u.id
+       WHERE u.email = $1 OR s.admission_number = $2`,
+      [normalizeEmail(childIdentifier), childIdentifier]
     );
     if (childQuery.rows.length === 0) return res.status(404).json({ error: "Child not found" });
 
