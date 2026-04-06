@@ -88,6 +88,31 @@ async function getStudentRecordByEmail(email) {
   return result.rows[0] || null;
 }
 
+async function ensureAdminUser(email) {
+  const user = await getUserByEmail(email);
+  if (!user || user.role !== 'admin') {
+    return null;
+  }
+  return user;
+}
+
+function looksLikeViolation(messageText) {
+  const text = String(messageText || '').toLowerCase();
+  if (!text) return false;
+  const riskyTerms = [
+    'nude',
+    'nudes',
+    'explicit',
+    'sex',
+    'porn',
+    'private photo',
+    'private video',
+    'leak',
+    'send pic'
+  ];
+  return riskyTerms.some((term) => text.includes(term));
+}
+
 async function ensureAcceptedFriendship(userId, otherUserId) {
   const result = await pool.query(
     `SELECT id
@@ -1346,6 +1371,187 @@ app.put("/notifications/:id/read", async (req, res) => {
   } catch (e) {
     console.error("Mark Notification Read Error:", e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/admin/database-summary/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const admin = await ensureAdminUser(email);
+    if (!admin) {
+      return res.status(403).json({ error: "Only admin accounts can access this resource" });
+    }
+
+    const summaryResult = await pool.query(`
+      SELECT
+        (SELECT COUNT(*) FROM students) AS students_count,
+        (SELECT COUNT(*) FROM teachers) AS teachers_count,
+        (SELECT COUNT(*) FROM parents) AS parents_count,
+        (SELECT COUNT(*) FROM users) AS users_count,
+        (SELECT COUNT(*) FROM pending_registrations_view) AS pending_users_count
+    `).catch(async () => {
+      return pool.query(`
+        SELECT
+          (SELECT COUNT(*) FROM students) AS students_count,
+          (SELECT COUNT(*) FROM teachers) AS teachers_count,
+          (SELECT COUNT(*) FROM parents) AS parents_count,
+          (SELECT COUNT(*) FROM users) AS users_count,
+          (SELECT COUNT(*) FROM registration WHERE approved = false) AS pending_users_count
+      `);
+    });
+
+    const financeResult = await pool.query(`
+      SELECT COALESCE(SUM(CASE WHEN status <> 'paid' THEN amount ELSE 0 END), 0) AS pending_fees
+      FROM finance
+    `);
+
+    const moderationResult = await pool.query(`
+      SELECT COUNT(*) AS flagged_messages
+      FROM messages
+      WHERE moderation_status IS NOT NULL
+        AND moderation_status <> 'clear'
+    `);
+
+    res.json({
+      ...summaryResult.rows[0],
+      pending_fees: financeResult.rows[0]?.pending_fees ?? 0,
+      flagged_messages: moderationResult.rows[0]?.flagged_messages ?? 0,
+    });
+  } catch (e) {
+    console.error("Admin Database Summary Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/admin/chat/moderation/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const admin = await ensureAdminUser(email);
+    if (!admin) {
+      return res.status(403).json({ error: "Only admin accounts can access this resource" });
+    }
+
+    const result = await pool.query(`
+      SELECT m.id,
+             m.message,
+             m.created_at,
+             m.message_type,
+             m.media_url,
+             m.group_id,
+             m.moderation_status,
+             m.moderation_reason,
+             m.flagged_at,
+             sender.email AS sender_email,
+             receiver.email AS receiver_email,
+             COALESCE(ss.full_name, st.full_name, sp.full_name, sa.full_name, sender.username, sender.email) AS sender_name,
+             COALESCE(rs.full_name, rt.full_name, rp.full_name, ra.full_name, receiver.username, receiver.email) AS receiver_name,
+             g.name AS group_name,
+             sender.role AS sender_role,
+             receiver.role AS receiver_role
+      FROM messages m
+      LEFT JOIN users sender ON sender.id = m.sender_id
+      LEFT JOIN users receiver ON receiver.id = m.receiver_id
+      LEFT JOIN students ss ON ss.user_id = sender.id
+      LEFT JOIN teachers st ON st.user_id = sender.id
+      LEFT JOIN parents sp ON sp.user_id = sender.id
+      LEFT JOIN admins sa ON sa.user_id = sender.id
+      LEFT JOIN students rs ON rs.user_id = receiver.id
+      LEFT JOIN teachers rt ON rt.user_id = receiver.id
+      LEFT JOIN parents rp ON rp.user_id = receiver.id
+      LEFT JOIN admins ra ON ra.user_id = receiver.id
+      LEFT JOIN chat_groups g ON g.id = m.group_id
+      ORDER BY m.created_at DESC
+      LIMIT 300
+    `);
+
+    const messages = result.rows.map((row) => {
+      const autoFlagged = looksLikeViolation(row.message);
+      const moderationStatus = row.moderation_status || (autoFlagged ? 'flagged' : 'clear');
+      const moderationReason = row.moderation_reason || (autoFlagged ? 'Potential privacy or explicit-content violation' : null);
+      return {
+        ...row,
+        moderation_status: moderationStatus,
+        moderation_reason: moderationReason,
+        flagged: moderationStatus !== 'clear',
+        target_user_email: row.sender_email,
+        target_user_name: row.sender_name,
+      };
+    });
+
+    const flaggedCount = messages.filter((item) => item.flagged).length;
+    res.json({
+      summary: {
+        total_messages: messages.length,
+        flagged_messages: flaggedCount,
+        groups_involved: new Set(messages.filter((m) => m.group_name).map((m) => m.group_name)).size,
+      },
+      messages,
+    });
+  } catch (e) {
+    console.error("Admin Chat Moderation Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/admin/chat/warn", async (req, res) => {
+  const adminEmail = normalizeEmail(req.body.adminEmail);
+  const targetEmail = normalizeEmail(req.body.targetEmail);
+  const reason = String(req.body.reason || "").trim();
+  const messageId = req.body.messageId || null;
+
+  if (!targetEmail || !reason) {
+    return res.status(400).json({ error: "Target email and reason are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const admin = await ensureAdminUser(adminEmail);
+    if (!admin) {
+      return res.status(403).json({ error: "Only admin accounts can send warnings" });
+    }
+
+    const target = await getUserByEmail(targetEmail);
+    if (!target) {
+      return res.status(404).json({ error: "Target user not found" });
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `INSERT INTO notifications (user_id, title, message, type, is_read)
+       VALUES ($1, $2, $3, 'warning', false)`,
+      [
+        target.id,
+        'Account Warning',
+        `Admin warning: ${reason}. Continued violations may lead to account suspension.`,
+      ]
+    );
+
+    await client.query(
+      `INSERT INTO admin_warnings (admin_user_id, target_user_id, message_id, reason, status)
+       VALUES ($1, $2, $3, $4, 'active')`,
+      [admin.id, target.id, messageId, reason]
+    );
+
+    if (messageId) {
+      await client.query(
+        `UPDATE messages
+         SET moderation_status = 'flagged',
+             moderation_reason = $2,
+             flagged_at = NOW()
+         WHERE id = $1`,
+        [messageId, reason]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.status(201).json({ ok: true });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Admin Chat Warning Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
   }
 });
 
