@@ -96,6 +96,111 @@ async function ensureAdminUser(email) {
   return user;
 }
 
+const CHAT_APPEAL_WINDOW_HOURS = Number(process.env.CHAT_APPEAL_WINDOW_HOURS || 48);
+
+function buildChatFreezeMessage(reason) {
+  return reason || "Chat access has been frozen. Please contact the school admin.";
+}
+
+async function syncChatFreezeForUser(userId) {
+  if (!userId) {
+    return {
+      isFrozen: false,
+      reason: null,
+      appealDeadlineAt: null,
+    };
+  }
+
+  const activeWarningResult = await pool.query(
+    `SELECT aw.id,
+            aw.reason,
+            aw.status,
+            aw.appeal_status,
+            aw.appeal_deadline_at,
+            aw.created_at
+     FROM admin_warnings aw
+     WHERE aw.target_user_id = $1
+       AND aw.status = 'active'
+     ORDER BY aw.created_at DESC
+     LIMIT 1`,
+    [userId]
+  );
+
+  const warning = activeWarningResult.rows[0];
+  const now = new Date();
+  const deadline = warning?.appeal_deadline_at ? new Date(warning.appeal_deadline_at) : null;
+  const missedAppealWindow =
+    warning &&
+    warning.appeal_status !== 'submitted' &&
+    warning.appeal_status !== 'accepted' &&
+    deadline &&
+    deadline.getTime() <= now.getTime();
+
+  if (missedAppealWindow) {
+    await pool.query(
+      `UPDATE users
+       SET is_chat_frozen = true,
+           chat_frozen_at = COALESCE(chat_frozen_at, NOW()),
+           chat_freeze_reason = $2
+       WHERE id = $1`,
+      [userId, `Chat frozen after missed appeal deadline: ${warning.reason}`]
+    );
+    return {
+      isFrozen: true,
+      reason: `Chat frozen after missed appeal deadline: ${warning.reason}`,
+      warning,
+      appealDeadlineAt: warning.appeal_deadline_at,
+    };
+  }
+
+  const userResult = await pool.query(
+    `SELECT is_chat_frozen, chat_frozen_at, chat_freeze_reason, chat_freeze_expires_at
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [userId]
+  );
+  const user = userResult.rows[0] || {};
+
+  if (warning && warning.appeal_status === 'submitted') {
+    return {
+      isFrozen: false,
+      reason: null,
+      warning,
+      appealDeadlineAt: warning.appeal_deadline_at,
+    };
+  }
+
+  return {
+    isFrozen: user.is_chat_frozen === true,
+    reason: user.chat_freeze_reason || null,
+    warning,
+    appealDeadlineAt: warning?.appeal_deadline_at || null,
+  };
+}
+
+async function ensureChatAccessAllowed(user) {
+  if (!user) {
+    return { ok: false, status: 404, error: "User not found" };
+  }
+
+  const chatState = await syncChatFreezeForUser(user.id);
+  if (chatState.isFrozen) {
+    return {
+      ok: false,
+      status: 423,
+      error: buildChatFreezeMessage(chatState.reason),
+      chatState,
+    };
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    chatState,
+  };
+}
+
 function looksLikeViolation(messageText) {
   const text = String(messageText || '').toLowerCase();
   if (!text) return false;
@@ -687,38 +792,108 @@ app.get("/pending-registrations", async (req, res) => {
 
 app.post("/approve-registration/:id", async (req, res) => {
   const { id } = req.params;
+  const client = await pool.connect();
   try {
-    const regResult = await pool.query("SELECT * FROM registration WHERE id = $1", [id]);
+    await client.query("BEGIN");
+    const regResult = await client.query(
+      "SELECT * FROM registration WHERE id = $1 FOR UPDATE",
+      [id]
+    );
     if (regResult.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ error: "Registration not found" });
     }
 
     const reg = regResult.rows[0];
     const role = (reg.role || 'student').toLowerCase().trim();
+    const fullName = String(reg.full_name || reg.username || 'New User').trim();
+    const phone = reg.phone || null;
 
-    const userResult = await pool.query(
-      "INSERT INTO users (username, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id",
-      [reg.username, reg.email, reg.password, role]
+    if (reg.approved === true) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "This registration is already approved" });
+    }
+
+    const existingUser = await client.query(
+      "SELECT id FROM users WHERE email = $1 OR username = $2 LIMIT 1",
+      [reg.email, reg.username]
     );
-    const userId = userResult.rows[0].id;
+    let userId;
 
-    if (role === 'parent') {
-      await pool.query(
-        "INSERT INTO parents (user_id, full_name) VALUES ($1, $2)",
-        [userId, reg.username || 'New Parent']
+    if (existingUser.rows.length > 0) {
+      userId = existingUser.rows[0].id;
+      await client.query(
+        `UPDATE users
+         SET username = $2,
+             email = $3,
+             password_hash = $4,
+             role = $5
+         WHERE id = $1`,
+        [userId, reg.username, reg.email, reg.password_hash, role]
+      );
+    } else {
+      const userResult = await client.query(
+        `INSERT INTO users (username, email, password_hash, role)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id`,
+        [reg.username, reg.email, reg.password_hash, role]
+      );
+      userId = userResult.rows[0].id;
+    }
+
+    if (role === 'student') {
+      await client.query(
+        `INSERT INTO students (user_id, full_name, phone)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (user_id)
+         DO UPDATE SET
+           full_name = EXCLUDED.full_name,
+           phone = EXCLUDED.phone,
+           updated_at = NOW()`,
+        [userId, fullName, phone]
       );
     }
 
-    await pool.query(
-      "UPDATE registration SET approved = true, approved_at = NOW(), approved_by = (SELECT id FROM admins LIMIT 1) WHERE id = $1",
+    if (role === 'teacher') {
+      await client.query(
+        `INSERT INTO teachers (user_id, full_name, phone)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (user_id)
+         DO UPDATE SET
+           full_name = EXCLUDED.full_name,
+           phone = EXCLUDED.phone,
+           updated_at = NOW()`,
+        [userId, fullName, phone]
+      );
+    }
+
+    if (role === 'parent') {
+      await client.query(
+        `INSERT INTO parents (user_id, full_name, phone)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (user_id)
+         DO UPDATE SET
+           full_name = EXCLUDED.full_name,
+           phone = EXCLUDED.phone,
+           updated_at = NOW()`,
+        [userId, fullName, phone]
+      );
+    }
+
+    await client.query(
+      "UPDATE registration SET approved = true, approved_at = NOW(), approved_by = (SELECT user_id FROM admins WHERE user_id IS NOT NULL LIMIT 1) WHERE id = $1",
       [id]
     );
 
     console.log(`Approved registration ${id} → Role: ${role}`);
+    await client.query("COMMIT");
     res.json({ message: "User approved successfully" });
   } catch (e) {
+    await client.query("ROLLBACK");
     console.error("Approval Error:", e);
     res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -1415,6 +1590,37 @@ app.post("/admin/notifications/broadcast", async (req, res) => {
     );
 
     for (const user of usersResult.rows) {
+      try {
+        await client.query(
+          `INSERT INTO notifications (
+             user_id,
+             title,
+             message,
+             type,
+             sender_user_id,
+             sender_role,
+             audience,
+             is_read
+           )
+           VALUES ($1, $2, $3, $4, $5, 'admin', $6, false)`,
+          [user.id, title, message, type, admin.id, audience]
+        );
+      } catch (_) {
+        await client.query(
+          `INSERT INTO notifications (
+             user_id,
+             title,
+             message,
+             type,
+             is_read
+           )
+           VALUES ($1, $2, $3, $4, false)`,
+          [user.id, title, message, type]
+        );
+      }
+    }
+
+    try {
       await client.query(
         `INSERT INTO notifications (
            user_id,
@@ -1426,25 +1632,22 @@ app.post("/admin/notifications/broadcast", async (req, res) => {
            audience,
            is_read
          )
-         VALUES ($1, $2, $3, $4, $5, 'admin', $6, false)`,
-        [user.id, title, message, type, admin.id, audience]
+         VALUES ($1, $2, $3, 'system', $1, 'admin', $4, false)`,
+        [admin.id, 'Broadcast sent', `Your message "${title}" was sent to ${usersResult.rows.length} user(s).`, audience]
+      );
+    } catch (_) {
+      await client.query(
+        `INSERT INTO notifications (
+           user_id,
+           title,
+           message,
+           type,
+           is_read
+         )
+         VALUES ($1, $2, $3, 'system', false)`,
+        [admin.id, 'Broadcast sent', `Your message "${title}" was sent to ${usersResult.rows.length} user(s).`]
       );
     }
-
-    await client.query(
-      `INSERT INTO notifications (
-         user_id,
-         title,
-         message,
-         type,
-         sender_user_id,
-         sender_role,
-         audience,
-         is_read
-       )
-       VALUES ($1, $2, $3, 'system', $1, 'admin', $4, false)`,
-      [admin.id, 'Broadcast sent', `Your message "${title}" was sent to ${usersResult.rows.length} user(s).`, audience]
-    );
 
     await client.query("COMMIT");
     res.status(201).json({ ok: true, recipients: usersResult.rows.length });
@@ -1524,6 +1727,14 @@ app.get("/admin/chat/moderation/:email", async (req, res) => {
              m.moderation_status,
              m.moderation_reason,
              m.flagged_at,
+             aw.id AS warning_id,
+             aw.status AS warning_status,
+             aw.appeal_status,
+             aw.appeal_message,
+             aw.appeal_submitted_at,
+             aw.appeal_deadline_at,
+             aw.resolved_at,
+             aw.resolution_note,
              sender.email AS sender_email,
              receiver.email AS receiver_email,
              COALESCE(ss.full_name, st.full_name, sp.full_name, sa.full_name, sender.username, sender.email) AS sender_name,
@@ -1543,6 +1754,13 @@ app.get("/admin/chat/moderation/:email", async (req, res) => {
       LEFT JOIN parents rp ON rp.user_id = receiver.id
       LEFT JOIN admins ra ON ra.user_id = receiver.id
       LEFT JOIN chat_groups g ON g.id = m.group_id
+      LEFT JOIN LATERAL (
+        SELECT aw.*
+        FROM admin_warnings aw
+        WHERE aw.message_id = m.id
+        ORDER BY aw.created_at DESC
+        LIMIT 1
+      ) aw ON true
       ORDER BY m.created_at DESC
       LIMIT 300
     `);
@@ -1558,6 +1776,7 @@ app.get("/admin/chat/moderation/:email", async (req, res) => {
         flagged: moderationStatus !== 'clear',
         target_user_email: row.sender_email,
         target_user_name: row.sender_name,
+        can_unflag: moderationStatus !== 'clear' && row.appeal_status === 'submitted',
       };
     });
 
@@ -1611,9 +1830,17 @@ app.post("/admin/chat/warn", async (req, res) => {
     );
 
     await client.query(
-      `INSERT INTO admin_warnings (admin_user_id, target_user_id, message_id, reason, status)
-       VALUES ($1, $2, $3, $4, 'active')`,
-      [admin.id, target.id, messageId, reason]
+      `INSERT INTO admin_warnings (
+         admin_user_id,
+         target_user_id,
+         message_id,
+         reason,
+         status,
+         appeal_status,
+         appeal_deadline_at
+       )
+       VALUES ($1, $2, $3, $4, 'active', 'pending', NOW() + ($5 * INTERVAL '1 hour'))`,
+      [admin.id, target.id, messageId, reason, CHAT_APPEAL_WINDOW_HOURS]
     );
 
     if (messageId) {
@@ -1638,16 +1865,415 @@ app.post("/admin/chat/warn", async (req, res) => {
   }
 });
 
+app.post("/admin/chat/unflag", async (req, res) => {
+  const adminEmail = normalizeEmail(req.body.adminEmail);
+  const warningId = req.body.warningId || null;
+  const messageId = req.body.messageId || null;
+  const resolutionNote = String(req.body.resolutionNote || "Appeal accepted by admin").trim();
+
+  if (!warningId && !messageId) {
+    return res.status(400).json({ error: "Warning ID or message ID is required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const admin = await ensureAdminUser(adminEmail);
+    if (!admin) {
+      return res.status(403).json({ error: "Only admin accounts can unflag messages" });
+    }
+
+    await client.query("BEGIN");
+
+    const warningResult = warningId
+      ? await client.query(
+          `SELECT id, target_user_id, message_id
+           FROM admin_warnings
+           WHERE id = $1
+           LIMIT 1`,
+          [warningId]
+        )
+      : await client.query(
+          `SELECT id, target_user_id, message_id
+           FROM admin_warnings
+           WHERE message_id = $1
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [messageId]
+        );
+
+    const warning = warningResult.rows[0];
+    if (!warning) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Warning record not found" });
+    }
+
+    await client.query(
+      `UPDATE admin_warnings
+       SET status = 'resolved',
+           appeal_status = CASE
+             WHEN appeal_status = 'submitted' THEN 'accepted'
+             ELSE appeal_status
+           END,
+           resolved_at = NOW(),
+           resolution_note = $2
+       WHERE id = $1`,
+      [warning.id, resolutionNote]
+    );
+
+    if (warning.message_id) {
+      await client.query(
+        `UPDATE messages
+         SET moderation_status = 'clear',
+             moderation_reason = NULL,
+             flagged_at = NULL,
+             reviewed_at = NOW(),
+             reviewed_by = $2
+         WHERE id = $1`,
+        [warning.message_id, admin.id]
+      );
+    }
+
+    await client.query(
+      `UPDATE users
+       SET is_chat_frozen = false,
+           chat_frozen_at = NULL,
+           chat_freeze_reason = NULL,
+           chat_freeze_expires_at = NULL
+       WHERE id = $1`,
+      [warning.target_user_id]
+    );
+
+    await client.query(
+      `INSERT INTO notifications (user_id, title, message, type, is_read)
+       VALUES ($1, 'Appeal approved', $2, 'appeal_update', false)`,
+      [warning.target_user_id, 'Your appeal was accepted. Chat access is active again.']
+    );
+
+    await client.query("COMMIT");
+    res.status(200).json({ ok: true });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Admin Chat Unflag Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/chat/access/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const access = await ensureChatAccessAllowed(user);
+    const warning = access.chatState?.warning || null;
+    return res.status(200).json({
+      can_chat: access.ok,
+      is_chat_frozen: access.chatState?.isFrozen === true,
+      reason: access.chatState?.reason || null,
+      appeal_deadline_at: access.chatState?.appealDeadlineAt || null,
+      active_warning: warning
+        ? {
+            id: warning.id,
+            reason: warning.reason,
+            status: warning.status,
+            appeal_status: warning.appeal_status,
+            appeal_deadline_at: warning.appeal_deadline_at,
+            created_at: warning.created_at,
+          }
+        : null,
+    });
+  } catch (e) {
+    console.error("Chat Access Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/chat/appeals/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT aw.id,
+              aw.reason,
+              aw.status,
+              aw.appeal_status,
+              aw.appeal_message,
+              aw.appeal_submitted_at,
+              aw.appeal_deadline_at,
+              aw.created_at,
+              aw.resolved_at,
+              aw.resolution_note,
+              aw.message_id,
+              m.message AS flagged_message
+       FROM admin_warnings aw
+       LEFT JOIN messages m ON m.id = aw.message_id
+       WHERE aw.target_user_id = $1
+       ORDER BY aw.created_at DESC`,
+      [user.id]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Chat Appeals Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/appeals", async (req, res) => {
+  const studentEmail = normalizeEmail(req.body.studentEmail);
+  const warningId = req.body.warningId || null;
+  const appealMessage = String(req.body.appealMessage || "").trim();
+
+  if (!studentEmail || !warningId || !appealMessage) {
+    return res.status(400).json({ error: "Student email, warning ID, and appeal message are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const user = await getUserByEmail(studentEmail);
+    if (!user) {
+      return res.status(404).json({ error: "Student account was not found" });
+    }
+
+    await client.query("BEGIN");
+    const warningResult = await client.query(
+      `SELECT id, admin_user_id, status, appeal_status
+       FROM admin_warnings
+       WHERE id = $1
+         AND target_user_id = $2
+       LIMIT 1`,
+      [warningId, user.id]
+    );
+
+    const warning = warningResult.rows[0];
+    if (!warning) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Warning not found" });
+    }
+
+    if (warning.status !== 'active') {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "This warning is already closed" });
+    }
+
+    await client.query(
+      `UPDATE admin_warnings
+       SET appeal_message = $2,
+           appeal_status = 'submitted',
+           appeal_submitted_at = NOW()
+       WHERE id = $1`,
+      [warningId, appealMessage]
+    );
+
+    await client.query(
+      `UPDATE users
+       SET is_chat_frozen = false,
+           chat_frozen_at = NULL,
+           chat_freeze_reason = NULL,
+           chat_freeze_expires_at = NULL
+       WHERE id = $1`,
+      [user.id]
+    );
+
+    await client.query(
+      `INSERT INTO notifications (user_id, title, message, type, is_read)
+       VALUES ($1, 'New chat appeal', $2, 'appeal', false)`,
+      [
+        warning.admin_user_id,
+        `A user has submitted an appeal for a flagged chat warning.`,
+      ]
+    );
+
+    await client.query("COMMIT");
+    res.status(201).json({ ok: true });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Submit Chat Appeal Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/announcements", async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT id, title, message, priority, created_at
+      SELECT id,
+             title,
+             message,
+             priority,
+             announcement_type,
+             expires_after_view,
+             expiry_days,
+             expires_at,
+             audience_role,
+             created_at
       FROM announcements
+      WHERE expires_at IS NULL OR expires_at > NOW()
       ORDER BY created_at DESC
     `);
     res.json(result.rows);
   } catch (e) {
     console.error("Announcements Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/announcements/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT a.id,
+             a.title,
+             a.message,
+             a.priority,
+             a.announcement_type,
+             a.expires_after_view,
+             a.expiry_days,
+             a.expires_at,
+             a.audience_role,
+             a.created_at,
+             av.viewed_at,
+             av.expires_at AS view_expires_at
+      FROM announcements a
+      LEFT JOIN announcement_views av
+        ON av.announcement_id = a.id
+       AND av.user_id = $1
+      WHERE (a.audience_role = 'all' OR a.audience_role = $2)
+        AND (a.expires_at IS NULL OR a.expires_at > NOW())
+        AND (
+          a.expires_after_view = false
+          OR av.id IS NULL
+          OR av.expires_at IS NULL
+          OR av.expires_at > NOW()
+        )
+      ORDER BY a.created_at DESC
+      `,
+      [user.id, user.role]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Announcements By User Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/announcements/:id/view", async (req, res) => {
+  const announcementId = req.params.id;
+  const email = normalizeEmail(req.body.email);
+
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const announcementResult = await pool.query(
+      `SELECT id, expires_after_view, expiry_days
+       FROM announcements
+       WHERE id = $1
+       LIMIT 1`,
+      [announcementId]
+    );
+
+    if (announcementResult.rows.length == 0) {
+      return res.status(404).json({ error: "Announcement not found" });
+    }
+
+    const announcement = announcementResult.rows[0];
+    let viewExpiresAt = null;
+    if (announcement.expires_after_view === true && announcement.expiry_days != null) {
+      viewExpiresAt = new Date(Date.now() + Number(announcement.expiry_days) * 24 * 60 * 60 * 1000);
+    }
+
+    const result = await pool.query(
+      `INSERT INTO announcement_views (announcement_id, user_id, viewed_at, expires_at)
+       VALUES ($1, $2, NOW(), $3)
+       ON CONFLICT (announcement_id, user_id)
+       DO UPDATE SET
+         viewed_at = NOW(),
+         expires_at = EXCLUDED.expires_at
+       RETURNING *`,
+      [announcementId, user.id, viewExpiresAt]
+    );
+
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error("Announcement View Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/admin/announcements", async (req, res) => {
+  const adminEmail = normalizeEmail(req.body.adminEmail);
+  const title = String(req.body.title || '').trim();
+  const message = String(req.body.message || '').trim();
+  const priority = String(req.body.priority || 'normal').trim().toLowerCase();
+  const announcementType = String(req.body.announcementType || 'activity').trim().toLowerCase();
+  const audienceRole = String(req.body.audienceRole || 'all').trim().toLowerCase();
+  const expiresAfterView = req.body.expiresAfterView === true;
+  const expiryDays = req.body.expiryDays == null || req.body.expiryDays == ''
+    ? null
+    : Number(req.body.expiryDays);
+
+  if (!title || !message) {
+    return res.status(400).json({ error: "Title and message are required" });
+  }
+
+  try {
+    const admin = await ensureAdminUser(adminEmail);
+    if (!admin) {
+      return res.status(403).json({ error: "Only admin accounts can create announcements" });
+    }
+
+    const expiresAt = !expiresAfterView && expiryDays != null
+      ? new Date(Date.now() + expiryDays * 24 * 60 * 60 * 1000)
+      : null;
+
+    const result = await pool.query(
+      `INSERT INTO announcements (
+         title,
+         message,
+         priority,
+         announcement_type,
+         expires_after_view,
+         expiry_days,
+         expires_at,
+         audience_role,
+         created_by
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [
+        title,
+        message,
+        priority,
+        announcementType,
+        expiresAfterView,
+        expiryDays,
+        expiresAt,
+        audienceRole,
+        admin.id,
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (e) {
+    console.error("Admin Announcement Create Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -1923,6 +2549,11 @@ app.get("/chat/contacts/:email", async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
+    const access = await ensureChatAccessAllowed(user);
+    if (!access.ok) {
+      return res.status(access.status).json({ error: access.error });
+    }
+
     const result = await pool.query(
       `WITH contacts AS (
          SELECT CASE
@@ -2002,6 +2633,11 @@ app.get("/chat/thread/:email/:peerEmail", async (req, res) => {
       return res.status(404).json({ error: "User was not found" });
     }
 
+    const access = await ensureChatAccessAllowed(user);
+    if (!access.ok) {
+      return res.status(access.status).json({ error: access.error });
+    }
+
     const canChat = await ensureAcceptedFriendship(user.id, peer.id);
     if (!canChat) {
       return res.status(403).json({ error: "You must be friends before chatting" });
@@ -2068,6 +2704,11 @@ app.post("/chat/thread/send", async (req, res) => {
       return res.status(404).json({ error: "Sender or receiver was not found" });
     }
 
+    const access = await ensureChatAccessAllowed(sender);
+    if (!access.ok) {
+      return res.status(access.status).json({ error: access.error });
+    }
+
     const canChat = await ensureAcceptedFriendship(sender.id, receiver.id);
     if (!canChat) {
       return res.status(403).json({ error: "You must be friends before chatting" });
@@ -2124,6 +2765,11 @@ app.post("/chat/thread/read", async (req, res) => {
       return res.status(404).json({ error: "Reader or peer was not found" });
     }
 
+    const access = await ensureChatAccessAllowed(reader);
+    if (!access.ok) {
+      return res.status(access.status).json({ error: access.error });
+    }
+
     const canChat = await ensureAcceptedFriendship(reader.id, peer.id);
     if (!canChat) {
       return res.status(403).json({ error: "You must be friends before chatting" });
@@ -2153,6 +2799,11 @@ app.get("/chat/groups/:email", async (req, res) => {
     const user = await getUserByEmail(email);
     if (!user) {
       return res.status(404).json({ error: "User not found" });
+    }
+
+    const access = await ensureChatAccessAllowed(user);
+    if (!access.ok) {
+      return res.status(access.status).json({ error: access.error });
     }
 
     const result = await pool.query(
@@ -2194,6 +2845,11 @@ app.post("/chat/groups", async (req, res) => {
     const creator = await getUserByEmail(creatorEmail);
     if (!creator) {
       return res.status(404).json({ error: "Creator not found" });
+    }
+
+    const access = await ensureChatAccessAllowed(creator);
+    if (!access.ok) {
+      return res.status(access.status).json({ error: access.error });
     }
 
     const normalizedEmails = [...new Set([creatorEmail, ...memberEmails.map(normalizeEmail)])];
@@ -2245,6 +2901,11 @@ app.post("/chat/groups/:groupId/add-members", async (req, res) => {
       return res.status(404).json({ error: "Actor not found" });
     }
 
+    const access = await ensureChatAccessAllowed(actor);
+    if (!access.ok) {
+      return res.status(access.status).json({ error: access.error });
+    }
+
     const membership = await client.query(
       `SELECT id
        FROM chat_group_members
@@ -2291,6 +2952,11 @@ app.get("/chat/groups/:groupId/messages/:email", async (req, res) => {
     const user = await getUserByEmail(email);
     if (!user) {
       return res.status(404).json({ error: "User not found" });
+    }
+
+    const access = await ensureChatAccessAllowed(user);
+    if (!access.ok) {
+      return res.status(access.status).json({ error: access.error });
     }
 
     const membership = await pool.query(
@@ -2350,6 +3016,11 @@ app.post("/chat/groups/:groupId/messages", async (req, res) => {
     const sender = await getUserByEmail(senderEmail);
     if (!sender) {
       return res.status(404).json({ error: "Sender not found" });
+    }
+
+    const access = await ensureChatAccessAllowed(sender);
+    if (!access.ok) {
+      return res.status(access.status).json({ error: access.error });
     }
 
     const membership = await pool.query(
