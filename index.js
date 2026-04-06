@@ -70,6 +70,24 @@ async function getUserByEmail(email) {
   return result.rows[0] || null;
 }
 
+async function getStudentRecordByEmail(email) {
+  const normalizedEmail = normalizeEmail(email);
+  const result = await pool.query(
+    `SELECT s.id,
+            s.user_id,
+            s.full_name,
+            s.class_name,
+            s.admission_number,
+            u.email
+     FROM students s
+     JOIN users u ON u.id = s.user_id
+     WHERE u.email = $1
+     LIMIT 1`,
+    [normalizedEmail]
+  );
+  return result.rows[0] || null;
+}
+
 async function ensureAcceptedFriendship(userId, otherUserId) {
   const result = await pool.query(
     `SELECT id
@@ -1002,6 +1020,198 @@ app.get("/live-classes", async (req, res) => {
   }
 });
 
+app.get("/assignments/:studentEmail", async (req, res) => {
+  const studentEmail = normalizeEmail(req.params.studentEmail);
+  const submittedOnly = String(req.query.submitted || "").toLowerCase() === "true";
+
+  try {
+    const student = await getStudentRecordByEmail(studentEmail);
+    if (!student) {
+      return res.status(404).json({ error: "Student not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT a.id,
+              a.title,
+              a.description,
+              a.class_name,
+              a.attachment_url,
+              a.youtube_url,
+              a.assigned_at,
+              a.due_date,
+              a.status,
+              a.subject_id,
+              a.teacher_id,
+              COALESCE(sub.subject_name, 'General') AS subject_name,
+              COALESCE(t.full_name, 'Teacher') AS teacher_name,
+              submission.id AS submission_id,
+              submission.submission_text,
+              submission.submission_file_url,
+              submission.submitted_at,
+              submission.status AS submission_status,
+              submission.score,
+              submission.feedback,
+              COALESCE(submission.is_late, false) AS is_late,
+              (submission.id IS NOT NULL) AS is_submitted
+       FROM assignments a
+       LEFT JOIN subjects sub ON sub.id = a.subject_id
+       LEFT JOIN teachers t ON t.id = a.teacher_id
+       LEFT JOIN assignment_submissions submission
+         ON submission.assignment_id = a.id
+        AND submission.student_id = $1
+       WHERE (a.class_name IS NULL OR a.class_name = '' OR a.class_name = $2)
+         AND ($3::boolean = false OR submission.id IS NOT NULL)
+       ORDER BY COALESCE(a.due_date, a.assigned_at, NOW()) ASC`,
+      [student.id, student.class_name || "", submittedOnly]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Assignments Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/assignments/:studentEmail/submitted", async (req, res) => {
+  const studentEmail = normalizeEmail(req.params.studentEmail);
+
+  try {
+    const student = await getStudentRecordByEmail(studentEmail);
+    if (!student) {
+      return res.status(404).json({ error: "Student not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT a.id,
+              a.title,
+              a.description,
+              a.class_name,
+              a.attachment_url,
+              a.youtube_url,
+              a.assigned_at,
+              a.due_date,
+              a.status,
+              a.subject_id,
+              a.teacher_id,
+              COALESCE(sub.subject_name, 'General') AS subject_name,
+              COALESCE(t.full_name, 'Teacher') AS teacher_name,
+              submission.id AS submission_id,
+              submission.submission_text,
+              submission.submission_file_url,
+              submission.submitted_at,
+              submission.status AS submission_status,
+              submission.score,
+              submission.feedback,
+              COALESCE(submission.is_late, false) AS is_late,
+              true AS is_submitted
+       FROM assignments a
+       JOIN assignment_submissions submission
+         ON submission.assignment_id = a.id
+        AND submission.student_id = $1
+       LEFT JOIN subjects sub ON sub.id = a.subject_id
+       LEFT JOIN teachers t ON t.id = a.teacher_id
+       WHERE a.class_name IS NULL OR a.class_name = '' OR a.class_name = $2
+       ORDER BY COALESCE(submission.submitted_at, a.due_date, a.assigned_at, NOW()) DESC`,
+      [student.id, student.class_name || ""]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Submitted Assignments Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/assignments/:assignmentId/submit", async (req, res) => {
+  const assignmentId = req.params.assignmentId;
+  const studentEmail = normalizeEmail(req.body.studentEmail);
+  const submissionText = String(req.body.submissionText || "").trim();
+  const submissionFileUrl = req.body.submissionFileUrl || null;
+
+  if (!studentEmail) {
+    return res.status(400).json({ error: "Student email is required" });
+  }
+
+  if (!submissionText && !submissionFileUrl) {
+    return res.status(400).json({ error: "Submission text or attachment is required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const student = await getStudentRecordByEmail(studentEmail);
+    if (!student) {
+      return res.status(404).json({ error: "Student not found" });
+    }
+
+    const assignmentResult = await client.query(
+      `SELECT id, title, due_date
+       FROM assignments
+       WHERE id = $1
+       LIMIT 1`,
+      [assignmentId]
+    );
+
+    if (assignmentResult.rows.length === 0) {
+      return res.status(404).json({ error: "Assignment not found" });
+    }
+
+    const assignment = assignmentResult.rows[0];
+    const dueDate = assignment.due_date ? new Date(assignment.due_date) : null;
+    const isLate = dueDate ? dueDate.getTime() < Date.now() : false;
+
+    const result = await client.query(
+      `INSERT INTO assignment_submissions (
+         assignment_id,
+         student_id,
+         submission_text,
+         submission_file_url,
+         submitted_at,
+         status,
+         is_late
+       )
+       VALUES ($1, $2, $3, $4, NOW(), 'submitted', $5)
+       ON CONFLICT (assignment_id, student_id)
+       DO UPDATE SET
+         submission_text = EXCLUDED.submission_text,
+         submission_file_url = EXCLUDED.submission_file_url,
+         submitted_at = NOW(),
+         status = 'submitted',
+         is_late = EXCLUDED.is_late
+       RETURNING *`,
+      [
+        assignmentId,
+        student.id,
+        submissionText || null,
+        submissionFileUrl,
+        isLate,
+      ]
+    );
+
+    await client.query(
+      `INSERT INTO notifications (user_id, title, message, type, is_read)
+       VALUES (
+         $1,
+         $2,
+         $3,
+         'assignment_submission',
+         false
+       )`,
+      [
+        student.user_id,
+        'Assignment submitted',
+        `Your submission for "${assignment.title}" was saved successfully.`,
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (e) {
+    console.error("Submit Assignment Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/live-classes/:studentEmail", async (req, res) => {
   const { studentEmail } = req.params;
   try {
@@ -1085,6 +1295,56 @@ app.get("/messages/:email", async (req, res) => {
     res.json(result.rows);
   } catch (e) {
     console.error("Messages Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/notifications/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT id,
+              title,
+              message,
+              type,
+              is_read,
+              created_at
+       FROM notifications
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [user.id]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Notifications Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put("/notifications/:id/read", async (req, res) => {
+  const notificationId = req.params.id;
+  try {
+    const result = await pool.query(
+      `UPDATE notifications
+       SET is_read = true
+       WHERE id = $1
+       RETURNING id, is_read`,
+      [notificationId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Notification not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error("Mark Notification Read Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
