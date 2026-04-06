@@ -1006,6 +1006,44 @@ app.post("/students/:id/unlock-profile", async (req, res) => {
   }
 });
 
+app.post("/students/unlock-all-profiles", async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE students
+       SET profile_locked = false,
+           updated_at = NOW()
+       WHERE COALESCE(profile_locked, false) = true`
+    );
+
+    res.json({
+      message: "All student profiles unlocked for one edit.",
+      updated_count: result.rowCount || 0,
+    });
+  } catch (e) {
+    console.error("Unlock All Student Profiles Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/students/lock-all-profiles", async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE students
+       SET profile_locked = true,
+           updated_at = NOW()
+       WHERE COALESCE(profile_locked, false) = false`
+    );
+
+    res.json({
+      message: "All student profiles locked.",
+      updated_count: result.rowCount || 0,
+    });
+  } catch (e) {
+    console.error("Lock All Student Profiles Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.put("/update-student/:id", async (req, res) => {
   const studentId = req.params.id;
   const name = String(req.body.name || "").trim();
@@ -1085,6 +1123,176 @@ app.delete("/delete-student/:id", async (req, res) => {
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("Delete Student Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/teachers", async (req, res) => {
+  const page = Math.max(parseInt(req.query.page || "0", 10), 0);
+  const pageSize = Math.min(Math.max(parseInt(req.query.pageSize || "20", 10), 1), 100);
+  const search = String(req.query.search || "").trim();
+  const offset = page * pageSize;
+
+  try {
+    const searchParam = `%${search}%`;
+    const result = await pool.query(
+      `SELECT t.id,
+              t.user_id,
+              t.full_name,
+              t.teacher_number,
+              t.subject,
+              t.class_name,
+              t.phone,
+              t.profile_picture_url,
+              COALESCE(t.profile_locked, true) AS profile_locked,
+              t.updated_at,
+              u.email,
+              COUNT(*) OVER() AS total_count
+       FROM teachers t
+       JOIN users u ON u.id = t.user_id
+       WHERE (
+         $1 = ''
+         OR t.full_name ILIKE $2
+         OR u.email ILIKE $2
+         OR COALESCE(t.teacher_number, '') ILIKE $2
+         OR COALESCE(t.subject, '') ILIKE $2
+         OR COALESCE(t.class_name, '') ILIKE $2
+       )
+       ORDER BY t.updated_at DESC NULLS LAST, t.created_at DESC
+       LIMIT $3 OFFSET $4`,
+      [search, searchParam, pageSize, offset]
+    );
+
+    const total =
+      result.rows.length > 0 ? Number(result.rows[0].total_count || result.rows.length) : 0;
+    res.json({
+      data: result.rows.map((row) => ({
+        ...row,
+        total_count: undefined,
+      })),
+      total,
+      page,
+      pageSize,
+    });
+  } catch (e) {
+    console.error("Get Teachers Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/teachers/:id/unlock-profile", async (req, res) => {
+  const teacherId = req.params.id;
+  try {
+    const result = await pool.query(
+      `UPDATE teachers
+       SET profile_locked = false,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, full_name, subject, class_name, teacher_number, profile_locked`,
+      [teacherId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Teacher not found" });
+    }
+
+    res.json({
+      message: "Teacher profile unlocked for one edit.",
+      teacher: result.rows[0],
+    });
+  } catch (e) {
+    console.error("Unlock Teacher Profile Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/teachers/unlock-all-profiles", async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE teachers
+       SET profile_locked = false,
+           updated_at = NOW()
+       WHERE COALESCE(profile_locked, true) = true`
+    );
+
+    res.json({
+      message: "All teacher profiles unlocked for one edit.",
+      updated_count: result.rowCount || 0,
+    });
+  } catch (e) {
+    console.error("Unlock All Teacher Profiles Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/teachers/lock-all-profiles", async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE teachers
+       SET profile_locked = true,
+           updated_at = NOW()
+       WHERE COALESCE(profile_locked, true) = false`
+    );
+
+    res.json({
+      message: "All teacher profiles locked.",
+      updated_count: result.rowCount || 0,
+    });
+  } catch (e) {
+    console.error("Lock All Teacher Profiles Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put("/update-teacher/:id", async (req, res) => {
+  const teacherId = req.params.id;
+  const name = String(req.body.name || "").trim();
+  const email = normalizeEmail(req.body.email);
+
+  if (!name || !email) {
+    return res.status(400).json({ error: "Teacher name and email are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const teacherResult = await client.query(
+      `SELECT t.id, t.user_id
+       FROM teachers t
+       WHERE t.id = $1
+       LIMIT 1`,
+      [teacherId]
+    );
+
+    if (teacherResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Teacher not found" });
+    }
+
+    const teacher = teacherResult.rows[0];
+
+    await client.query(
+      `UPDATE teachers
+       SET full_name = $2,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [teacherId, name]
+    );
+
+    await client.query(
+      `UPDATE users
+       SET email = $2
+       WHERE id = $1`,
+      [teacher.user_id, email]
+    );
+
+    await client.query("COMMIT");
+    res.json({ message: "Teacher updated successfully" });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Update Teacher Error:", e);
     res.status(500).json({ error: e.message });
   } finally {
     client.release();
@@ -1200,7 +1408,7 @@ app.put("/student-profile/:email", async (req, res) => {
     }
 
     const existingProfile = await pool.query(
-      "SELECT id, profile_locked FROM students WHERE user_id = $1 LIMIT 1",
+      "SELECT id, profile_locked, full_name, admission_number FROM students WHERE user_id = $1 LIMIT 1",
       [user.id]
     );
 
@@ -1213,6 +1421,15 @@ app.put("/student-profile/:email", async (req, res) => {
         error: "This student profile is locked. Ask an admin to edit it.",
       });
     }
+
+    const preservedFullName =
+      existingProfile.rows.length > 0
+        ? existingProfile.rows[0].full_name
+        : String(full_name).trim();
+    const preservedAdmissionNumber =
+      existingProfile.rows.length > 0
+        ? existingProfile.rows[0].admission_number
+        : String(admission_number).trim();
 
     const upsertResult = await pool.query(
       `INSERT INTO students (
@@ -1244,8 +1461,8 @@ app.put("/student-profile/:email", async (req, res) => {
        RETURNING id`,
       [
         user.id,
-        String(admission_number).trim(),
-        String(full_name).trim(),
+        preservedAdmissionNumber,
+        preservedFullName,
         gender ? String(gender).trim() : null,
         date_of_birth || null,
         String(class_name).trim(),
