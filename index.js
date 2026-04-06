@@ -264,6 +264,52 @@ async function ensureAcceptedFriendship(userId, otherUserId) {
   return result.rows.length > 0;
 }
 
+async function ensureAcceptedFriendshipOrFamily(userId, otherUserId) {
+  const acceptedFriendship = await ensureAcceptedFriendship(userId, otherUserId);
+  if (acceptedFriendship) return true;
+
+  const familyLink = await pool.query(
+    `SELECT 1
+     FROM parent_child pc
+     JOIN parents p ON p.id = pc.parent_id
+     JOIN students s ON s.id = pc.student_id
+     WHERE (p.user_id = $1 AND s.user_id = $2)
+        OR (p.user_id = $2 AND s.user_id = $1)
+     LIMIT 1`,
+    [userId, otherUserId]
+  );
+
+  return familyLink.rows.length > 0;
+}
+
+async function getGroupMembership(groupId, userId, client = pool) {
+  const result = await client.query(
+    `SELECT id, group_id, user_id, is_admin, COALESCE(role, CASE WHEN is_admin THEN 'admin' ELSE 'member' END) AS role
+     FROM chat_group_members
+     WHERE group_id = $1 AND user_id = $2
+     LIMIT 1`,
+    [groupId, userId]
+  );
+  return result.rows[0] || null;
+}
+
+function canManageGroupMembers(membership) {
+  if (!membership) return false;
+  return membership.is_admin === true || membership.role === 'admin' || membership.role === 'moderator';
+}
+
+async function ensureChatGroupRoleSchema(client = pool) {
+  await client.query(
+    `ALTER TABLE public.chat_group_members
+     ADD COLUMN IF NOT EXISTS role text DEFAULT 'member'`
+  );
+  await client.query(
+    `UPDATE public.chat_group_members
+     SET role = CASE WHEN is_admin = true THEN 'admin' ELSE 'member' END
+     WHERE role IS NULL OR role = ''`
+  );
+}
+
 function normalizeOtpChannel(channel) {
   return String(channel || "email").toLowerCase().trim();
 }
@@ -2133,6 +2179,7 @@ app.get("/admin/chat/moderation/:email", async (req, res) => {
              m.created_at,
              m.message_type,
              m.media_url,
+             m.thumbnail_url,
              m.group_id,
              m.moderation_status,
              m.moderation_reason,
@@ -3063,6 +3110,18 @@ app.get("/chat/contacts/:email", async (req, res) => {
          FROM friend_requests fr
          WHERE fr.status = 'accepted'
            AND (fr.sender_id = $1 OR fr.receiver_id = $1)
+         UNION
+         SELECT p.user_id AS contact_id
+         FROM parent_child pc
+         JOIN students s ON s.id = pc.student_id
+         JOIN parents p ON p.id = pc.parent_id
+         WHERE s.user_id = $1
+         UNION
+         SELECT s.user_id AS contact_id
+         FROM parent_child pc
+         JOIN students s ON s.id = pc.student_id
+         JOIN parents p ON p.id = pc.parent_id
+         WHERE p.user_id = $1
        ),
        latest_message AS (
          SELECT DISTINCT ON (
@@ -3123,6 +3182,34 @@ app.get("/chat/contacts/:email", async (req, res) => {
   }
 });
 
+app.get("/student/parents/:studentEmail", async (req, res) => {
+  const studentEmail = normalizeEmail(req.params.studentEmail);
+  try {
+    const result = await pool.query(
+      `SELECT p.id,
+              u.email,
+              p.full_name,
+              p.phone,
+              p.address,
+              p.profile_picture_url,
+              pc.relationship
+       FROM parent_child pc
+       JOIN students s ON s.id = pc.student_id
+       JOIN parents p ON p.id = pc.parent_id
+       JOIN users u ON u.id = p.user_id
+       JOIN users su ON su.id = s.user_id
+       WHERE su.email = $1
+       ORDER BY p.full_name ASC`,
+      [studentEmail]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Student Parents Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/chat/thread/:email/:peerEmail", async (req, res) => {
   const email = normalizeEmail(req.params.email);
   const peerEmail = normalizeEmail(req.params.peerEmail);
@@ -3138,7 +3225,7 @@ app.get("/chat/thread/:email/:peerEmail", async (req, res) => {
       return res.status(access.status).json({ error: access.error });
     }
 
-    const canChat = await ensureAcceptedFriendship(user.id, peer.id);
+    const canChat = await ensureAcceptedFriendshipOrFamily(user.id, peer.id);
     if (!canChat) {
       return res.status(403).json({ error: "You must be friends before chatting" });
     }
@@ -3209,7 +3296,7 @@ app.post("/chat/thread/send", async (req, res) => {
       return res.status(access.status).json({ error: access.error });
     }
 
-    const canChat = await ensureAcceptedFriendship(sender.id, receiver.id);
+    const canChat = await ensureAcceptedFriendshipOrFamily(sender.id, receiver.id);
     if (!canChat) {
       return res.status(403).json({ error: "You must be friends before chatting" });
     }
@@ -3270,7 +3357,7 @@ app.post("/chat/thread/read", async (req, res) => {
       return res.status(access.status).json({ error: access.error });
     }
 
-    const canChat = await ensureAcceptedFriendship(reader.id, peer.id);
+    const canChat = await ensureAcceptedFriendshipOrFamily(reader.id, peer.id);
     if (!canChat) {
       return res.status(403).json({ error: "You must be friends before chatting" });
     }
@@ -3342,6 +3429,7 @@ app.post("/chat/groups", async (req, res) => {
 
   const client = await pool.connect();
   try {
+    await ensureChatGroupRoleSchema(client);
     const creator = await getUserByEmail(creatorEmail);
     if (!creator) {
       return res.status(404).json({ error: "Creator not found" });
@@ -3370,11 +3458,12 @@ app.post("/chat/groups", async (req, res) => {
     const group = groupResult.rows[0];
 
     for (const member of memberResult.rows) {
+      const role = member.id === creator.id ? "admin" : "member";
       await client.query(
-        `INSERT INTO chat_group_members (group_id, user_id, is_admin)
-         VALUES ($1, $2, $3)
+        `INSERT INTO chat_group_members (group_id, user_id, is_admin, role)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (group_id, user_id) DO NOTHING`,
-        [group.id, member.id, member.id === creator.id]
+        [group.id, member.id, member.id === creator.id, role]
       );
     }
     await client.query("COMMIT");
@@ -3396,6 +3485,7 @@ app.post("/chat/groups/:groupId/add-members", async (req, res) => {
 
   const client = await pool.connect();
   try {
+    await ensureChatGroupRoleSchema(client);
     const actor = await getUserByEmail(actorEmail);
     if (!actor) {
       return res.status(404).json({ error: "Actor not found" });
@@ -3406,17 +3496,9 @@ app.post("/chat/groups/:groupId/add-members", async (req, res) => {
       return res.status(access.status).json({ error: access.error });
     }
 
-    const membership = await client.query(
-      `SELECT id
-       FROM chat_group_members
-       WHERE group_id = $1
-         AND user_id = $2
-         AND is_admin = true
-       LIMIT 1`,
-      [groupId, actor.id]
-    );
-    if (membership.rows.length === 0) {
-      return res.status(403).json({ error: "Only a group admin can add members" });
+    const membership = await getGroupMembership(groupId, actor.id, client);
+    if (!canManageGroupMembers(membership)) {
+      return res.status(403).json({ error: "Only a group admin or moderator can add members" });
     }
 
     const normalizedEmails = [...new Set(memberEmails.map(normalizeEmail))];
@@ -3429,8 +3511,8 @@ app.post("/chat/groups/:groupId/add-members", async (req, res) => {
 
     for (const member of members.rows) {
       await client.query(
-        `INSERT INTO chat_group_members (group_id, user_id, is_admin)
-         VALUES ($1, $2, false)
+        `INSERT INTO chat_group_members (group_id, user_id, is_admin, role)
+         VALUES ($1, $2, false, 'member')
          ON CONFLICT (group_id, user_id) DO NOTHING`,
         [groupId, member.id]
       );
@@ -3534,6 +3616,17 @@ app.post("/chat/groups/:groupId/messages", async (req, res) => {
       return res.status(403).json({ error: "You are not a member of this group" });
     }
 
+    const groupCheck = await pool.query(
+      `SELECT is_closed FROM chat_groups WHERE id = $1 LIMIT 1`,
+      [groupId]
+    );
+    if (groupCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Group not found" });
+    }
+    if (groupCheck.rows[0].is_closed === true) {
+      return res.status(403).json({ error: "This group has been closed by the admin" });
+    }
+
     if (!message.trim() && !mediaUrl) {
       return res.status(400).json({ error: "Message text or media is required" });
     }
@@ -3570,6 +3663,285 @@ app.post("/chat/groups/:groupId/messages", async (req, res) => {
     res.status(201).json(result.rows[0]);
   } catch (e) {
     console.error("Send Group Message Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/chat/groups/:groupId/details/:email", async (req, res) => {
+  const groupId = req.params.groupId;
+  const email = normalizeEmail(req.params.email);
+  try {
+    await ensureChatGroupRoleSchema();
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const membership = await getGroupMembership(groupId, user.id);
+    if (!membership) {
+      return res.status(403).json({ error: "You are not a member of this group" });
+    }
+
+    const result = await pool.query(
+      `SELECT g.*,
+              creator.email AS created_by_email,
+              COALESCE(cs.full_name, ct.full_name, cp.full_name, ca.full_name, creator.username, creator.email) AS created_by_name,
+              membership.is_admin,
+              membership.role,
+              (
+                SELECT array_agg(lower(u.email))
+                FROM chat_group_members gm
+                JOIN users u ON u.id = gm.user_id
+                WHERE gm.group_id = g.id
+                  AND (gm.is_admin = true OR COALESCE(gm.role, 'member') = 'admin')
+              ) AS admins
+       FROM chat_groups g
+       LEFT JOIN users creator ON creator.id = g.created_by
+       LEFT JOIN students cs ON cs.user_id = creator.id
+       LEFT JOIN teachers ct ON ct.user_id = creator.id
+       LEFT JOIN parents cp ON cp.user_id = creator.id
+       LEFT JOIN admins ca ON ca.user_id = creator.id
+       JOIN chat_group_members membership ON membership.group_id = g.id AND membership.user_id = $2
+       WHERE g.id = $1
+       LIMIT 1`,
+      [groupId, user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Group not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error("Get Group Details Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/chat/groups/:groupId/members", async (req, res) => {
+  const groupId = req.params.groupId;
+  try {
+    await ensureChatGroupRoleSchema();
+    const result = await pool.query(
+      `SELECT u.email,
+              gm.user_id,
+              gm.is_admin,
+              COALESCE(gm.role, CASE WHEN gm.is_admin THEN 'admin' ELSE 'member' END) AS role,
+              gm.joined_at,
+              COALESCE(s.full_name, t.full_name, p.full_name, a.full_name, u.username, u.email) AS display_name,
+              COALESCE(s.profile_picture_url, t.profile_picture_url, p.profile_picture_url, a.profile_picture_url) AS profile_picture_url
+       FROM chat_group_members gm
+       JOIN users u ON u.id = gm.user_id
+       LEFT JOIN students s ON s.user_id = u.id
+       LEFT JOIN teachers t ON t.user_id = u.id
+       LEFT JOIN parents p ON p.user_id = u.id
+       LEFT JOIN admins a ON a.user_id = u.id
+       WHERE gm.group_id = $1
+       ORDER BY CASE COALESCE(gm.role, CASE WHEN gm.is_admin THEN 'admin' ELSE 'member' END)
+           WHEN 'admin' THEN 0
+           WHEN 'moderator' THEN 1
+           ELSE 2
+         END,
+         display_name ASC`,
+      [groupId]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Get Group Members Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch("/chat/groups/:groupId/members/:memberEmail/role", async (req, res) => {
+  const groupId = req.params.groupId;
+  const memberEmail = normalizeEmail(req.params.memberEmail);
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const nextRole = String(req.body.role || "").trim().toLowerCase();
+
+  if (!["member", "moderator"].includes(nextRole)) {
+    return res.status(400).json({ error: "Role must be member or moderator" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await ensureChatGroupRoleSchema(client);
+    const actor = await getUserByEmail(actorEmail);
+    const member = await getUserByEmail(memberEmail);
+    if (!actor || !member) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const actorMembership = await getGroupMembership(groupId, actor.id, client);
+    if (!actorMembership || !(actorMembership.is_admin === true || actorMembership.role === "admin")) {
+      return res.status(403).json({ error: "Only a group admin can update member roles" });
+    }
+
+    const memberMembership = await getGroupMembership(groupId, member.id, client);
+    if (!memberMembership) {
+      return res.status(404).json({ error: "Member not found in this group" });
+    }
+    if (memberMembership.is_admin === true || memberMembership.role === "admin") {
+      return res.status(400).json({ error: "The group admin role cannot be changed here" });
+    }
+
+    const updated = await client.query(
+      `UPDATE chat_group_members
+       SET role = $3
+       WHERE group_id = $1 AND user_id = $2
+       RETURNING group_id, user_id, is_admin, role`,
+      [groupId, member.id, nextRole]
+    );
+
+    res.json(updated.rows[0]);
+  } catch (e) {
+    console.error("Update Group Member Role Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/chat/groups/:groupId", async (req, res) => {
+  const groupId = req.params.groupId;
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const name = req.body.name == null ? undefined : String(req.body.name).trim();
+  const description = req.body.description == null ? undefined : String(req.body.description).trim();
+  const bio = req.body.bio == null ? undefined : String(req.body.bio).trim();
+  const avatarUrl = req.body.avatarUrl == null ? undefined : req.body.avatarUrl;
+
+  try {
+    await ensureChatGroupRoleSchema();
+    const actor = await getUserByEmail(actorEmail);
+    if (!actor) {
+      return res.status(404).json({ error: "Actor not found" });
+    }
+
+    const membership = await getGroupMembership(groupId, actor.id);
+    if (!membership || !(membership.is_admin === true || membership.role === "admin")) {
+      return res.status(403).json({ error: "Only a group admin can update group info" });
+    }
+
+    const updated = await pool.query(
+      `UPDATE chat_groups
+       SET name = COALESCE(NULLIF($2, ''), name),
+           description = CASE WHEN $3 IS NULL THEN description ELSE $3 END,
+           bio = CASE WHEN $4 IS NULL THEN bio ELSE $4 END,
+           avatar_url = CASE WHEN $5 IS NULL THEN avatar_url ELSE $5 END,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING *`,
+      [groupId, name, description, bio, avatarUrl]
+    );
+
+    if (updated.rows.length === 0) {
+      return res.status(404).json({ error: "Group not found" });
+    }
+
+    res.json(updated.rows[0]);
+  } catch (e) {
+    console.error("Update Group Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/chat/groups/:groupId/members/:memberEmail", async (req, res) => {
+  const groupId = req.params.groupId;
+  const memberEmail = normalizeEmail(req.params.memberEmail);
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const client = await pool.connect();
+
+  try {
+    await ensureChatGroupRoleSchema(client);
+    const actor = await getUserByEmail(actorEmail);
+    const member = await getUserByEmail(memberEmail);
+    if (!actor || !member) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const actorMembership = await getGroupMembership(groupId, actor.id, client);
+    if (!canManageGroupMembers(actorMembership)) {
+      return res.status(403).json({ error: "Only a group admin or moderator can remove members" });
+    }
+
+    const memberMembership = await getGroupMembership(groupId, member.id, client);
+    if (!memberMembership) {
+      return res.status(404).json({ error: "Member not found in this group" });
+    }
+    if (memberMembership.is_admin === true || memberMembership.role === "admin") {
+      return res.status(400).json({ error: "The group admin cannot be removed from here" });
+    }
+    if (actorMembership.role === "moderator" && memberMembership.role === "moderator") {
+      return res.status(403).json({ error: "Moderators cannot remove other moderators" });
+    }
+
+    await client.query(
+      `DELETE FROM chat_group_members
+       WHERE group_id = $1 AND user_id = $2`,
+      [groupId, member.id]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Remove Group Member Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/chat/groups/:groupId/close", async (req, res) => {
+  const groupId = req.params.groupId;
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  try {
+    await ensureChatGroupRoleSchema();
+    const actor = await getUserByEmail(actorEmail);
+    if (!actor) {
+      return res.status(404).json({ error: "Actor not found" });
+    }
+
+    const membership = await getGroupMembership(groupId, actor.id);
+    if (!membership || !(membership.is_admin === true || membership.role === "admin")) {
+      return res.status(403).json({ error: "Only a group admin can close the group" });
+    }
+
+    const updated = await pool.query(
+      `UPDATE chat_groups
+       SET is_closed = true,
+           closed_at = CURRENT_TIMESTAMP,
+           closed_by = $2,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING *`,
+      [groupId, actor.id]
+    );
+
+    res.json(updated.rows[0] || { ok: true });
+  } catch (e) {
+    console.error("Close Group Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/chat/groups/:groupId", async (req, res) => {
+  const groupId = req.params.groupId;
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  try {
+    await ensureChatGroupRoleSchema();
+    const actor = await getUserByEmail(actorEmail);
+    if (!actor) {
+      return res.status(404).json({ error: "Actor not found" });
+    }
+
+    const membership = await getGroupMembership(groupId, actor.id);
+    if (!membership || !(membership.is_admin === true || membership.role === "admin")) {
+      return res.status(403).json({ error: "Only a group admin can delete the group" });
+    }
+
+    await pool.query(`DELETE FROM chat_groups WHERE id = $1`, [groupId]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Delete Group Error:", e);
     res.status(500).json({ error: e.message });
   }
 });

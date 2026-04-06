@@ -35,9 +35,20 @@ CREATE TABLE IF NOT EXISTS public.chat_group_members (
   group_id uuid NOT NULL REFERENCES public.chat_groups(id) ON DELETE CASCADE,
   user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
   is_admin boolean DEFAULT false,
+  role text DEFAULT 'member',
   joined_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (group_id, user_id)
 );
+
+ALTER TABLE public.chat_group_members
+ADD COLUMN IF NOT EXISTS role text DEFAULT 'member';
+
+UPDATE public.chat_group_members
+SET role = CASE WHEN is_admin = true THEN 'admin' ELSE 'member' END
+WHERE role IS NULL OR role = '';
+
+CREATE INDEX IF NOT EXISTS idx_chat_group_members_group_role
+ON public.chat_group_members(group_id, role);
 
 DO $$
 BEGIN

@@ -60,3 +60,6 @@ ON public.chat_group_members (group_id, user_id);
 
 CREATE UNIQUE INDEX IF NOT EXISTS friend_requests_sender_receiver_uidx
 ON public.friend_requests (sender_id, receiver_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS parent_child_parent_student_uidx
+ON public.parent_child (parent_id, student_id);
