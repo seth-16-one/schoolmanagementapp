@@ -903,6 +903,54 @@ app.get("/results/:studentEmail", async (req, res) => {
   }
 });
 
+app.get("/finance/dashboard-summary", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        COALESCE(SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END), 0) AS total_paid,
+        COALESCE(SUM(CASE WHEN status <> 'paid' OR status IS NULL THEN amount ELSE 0 END), 0) AS pending_fees,
+        COALESCE(SUM(CASE WHEN status <> 'paid' OR status IS NULL THEN amount ELSE 0 END), 0) AS balance,
+        COALESCE(SUM(
+          CASE
+            WHEN status = 'paid'
+             AND DATE_TRUNC('month', COALESCE(payment_date, created_at)) = DATE_TRUNC('month', NOW())
+            THEN amount
+            ELSE 0
+          END
+        ), 0) AS monthly_payment
+      FROM finance
+    `);
+
+    res.json(result.rows[0] || {});
+  } catch (e) {
+    console.error("Finance Dashboard Summary Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/finance/recent-transactions", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        f.id,
+        f.fee_type AS description,
+        f.amount,
+        f.status,
+        COALESCE(f.payment_date, f.created_at) AS transaction_date,
+        s.full_name AS student_name
+      FROM finance f
+      LEFT JOIN students s ON s.id = f.student_id
+      ORDER BY COALESCE(f.payment_date, f.created_at) DESC
+      LIMIT 12
+    `);
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("Finance Recent Transactions Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/finance/:studentEmail", async (req, res) => {
   const { studentEmail } = req.params;
   try {
