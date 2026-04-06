@@ -117,6 +117,7 @@ async function syncChatFreezeForUser(userId) {
             aw.status,
             aw.appeal_status,
             aw.appeal_deadline_at,
+            aw.freeze_until,
             aw.created_at
      FROM admin_warnings aw
      WHERE aw.target_user_id = $1
@@ -129,10 +130,12 @@ async function syncChatFreezeForUser(userId) {
   const warning = activeWarningResult.rows[0];
   const now = new Date();
   const deadline = warning?.appeal_deadline_at ? new Date(warning.appeal_deadline_at) : null;
+  const freezeUntil = warning?.freeze_until ? new Date(warning.freeze_until) : null;
   const missedAppealWindow =
     warning &&
     warning.appeal_status !== 'submitted' &&
     warning.appeal_status !== 'accepted' &&
+    warning.appeal_status !== 'rejected' &&
     deadline &&
     deadline.getTime() <= now.getTime();
 
@@ -162,10 +165,37 @@ async function syncChatFreezeForUser(userId) {
   );
   const user = userResult.rows[0] || {};
 
+  if (freezeUntil && freezeUntil.getTime() <= now.getTime()) {
+    await pool.query(
+      `UPDATE users
+       SET is_chat_frozen = false,
+           chat_frozen_at = NULL,
+           chat_freeze_reason = NULL,
+           chat_freeze_expires_at = NULL
+       WHERE id = $1`,
+      [userId]
+    );
+    return {
+      isFrozen: false,
+      reason: null,
+      warning,
+      appealDeadlineAt: warning?.appeal_deadline_at || null,
+    };
+  }
+
   if (warning && warning.appeal_status === 'submitted') {
     return {
       isFrozen: false,
       reason: null,
+      warning,
+      appealDeadlineAt: warning.appeal_deadline_at,
+    };
+  }
+
+  if (warning && warning.appeal_status === 'rejected' && freezeUntil && freezeUntil.getTime() > now.getTime()) {
+    return {
+      isFrozen: true,
+      reason: `Chat access is frozen until ${warning.freeze_until}.`,
       warning,
       appealDeadlineAt: warning.appeal_deadline_at,
     };
@@ -898,6 +928,169 @@ app.post("/approve-registration/:id", async (req, res) => {
 });
 
 // ===================== PARENT FEATURES =====================
+app.get("/students", async (req, res) => {
+  const page = Math.max(parseInt(req.query.page || "0", 10), 0);
+  const pageSize = Math.min(Math.max(parseInt(req.query.pageSize || "20", 10), 1), 100);
+  const search = String(req.query.search || "").trim();
+  const offset = page * pageSize;
+
+  try {
+    const searchParam = `%${search}%`;
+    const result = await pool.query(
+      `SELECT s.id,
+              s.user_id,
+              s.full_name,
+              s.class_name,
+              s.admission_number,
+              s.phone,
+              s.gender,
+              s.address,
+              s.profile_picture_url,
+              COALESCE(s.profile_locked, false) AS profile_locked,
+              s.updated_at,
+              u.email,
+              COUNT(*) OVER() AS total_count
+       FROM students s
+       JOIN users u ON u.id = s.user_id
+       WHERE (
+         $1 = ''
+         OR s.full_name ILIKE $2
+         OR u.email ILIKE $2
+         OR COALESCE(s.admission_number, '') ILIKE $2
+         OR COALESCE(s.class_name, '') ILIKE $2
+       )
+       ORDER BY s.updated_at DESC NULLS LAST, s.created_at DESC
+       LIMIT $3 OFFSET $4`,
+      [search, searchParam, pageSize, offset]
+    );
+
+    const total = result.rows.length > 0 ? Number(result.rows[0].total_count || result.rows.length) : 0;
+    res.json({
+      data: result.rows.map((row) => ({
+        ...row,
+        total_count: undefined,
+      })),
+      total,
+      page,
+      pageSize,
+    });
+  } catch (e) {
+    console.error("Get Students Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/students/:id/unlock-profile", async (req, res) => {
+  const studentId = req.params.id;
+  try {
+    const result = await pool.query(
+      `UPDATE students
+       SET profile_locked = false,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, full_name, class_name, admission_number, profile_locked`,
+      [studentId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Student not found" });
+    }
+
+    res.json({
+      message: "Student profile unlocked for one edit.",
+      student: result.rows[0],
+    });
+  } catch (e) {
+    console.error("Unlock Student Profile Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put("/update-student/:id", async (req, res) => {
+  const studentId = req.params.id;
+  const name = String(req.body.name || "").trim();
+  const email = normalizeEmail(req.body.email);
+
+  if (!name || !email) {
+    return res.status(400).json({ error: "Student name and email are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const studentResult = await client.query(
+      `SELECT s.id, s.user_id
+       FROM students s
+       WHERE s.id = $1
+       LIMIT 1`,
+      [studentId]
+    );
+
+    if (studentResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Student not found" });
+    }
+
+    const student = studentResult.rows[0];
+
+    await client.query(
+      `UPDATE students
+       SET full_name = $2,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [studentId, name]
+    );
+
+    await client.query(
+      `UPDATE users
+       SET email = $2
+       WHERE id = $1`,
+      [student.user_id, email]
+    );
+
+    await client.query("COMMIT");
+    res.json({ message: "Student updated successfully" });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Update Student Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/delete-student/:id", async (req, res) => {
+  const studentId = req.params.id;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const studentResult = await client.query(
+      `SELECT user_id
+       FROM students
+       WHERE id = $1
+       LIMIT 1`,
+      [studentId]
+    );
+
+    if (studentResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Student not found" });
+    }
+
+    const userId = studentResult.rows[0].user_id;
+    await client.query("DELETE FROM students WHERE id = $1", [studentId]);
+    await client.query("DELETE FROM users WHERE id = $1", [userId]);
+    await client.query("COMMIT");
+    res.json({ message: "Student deleted successfully" });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Delete Student Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/parent/children/:parentEmail", async (req, res) => {
   const { parentEmail } = req.params;
   try {
@@ -1776,7 +1969,8 @@ app.get("/admin/chat/moderation/:email", async (req, res) => {
         flagged: moderationStatus !== 'clear',
         target_user_email: row.sender_email,
         target_user_name: row.sender_name,
-        can_unflag: moderationStatus !== 'clear' && row.appeal_status === 'submitted',
+        can_unflag: moderationStatus !== 'clear',
+        can_reject_appeal: moderationStatus !== 'clear' && row.appeal_status === 'submitted',
       };
     });
 
@@ -1945,8 +2139,8 @@ app.post("/admin/chat/unflag", async (req, res) => {
 
     await client.query(
       `INSERT INTO notifications (user_id, title, message, type, is_read)
-       VALUES ($1, 'Appeal approved', $2, 'appeal_update', false)`,
-      [warning.target_user_id, 'Your appeal was accepted. Chat access is active again.']
+       VALUES ($1, 'Message unflagged', $2, 'appeal_update', false)`,
+      [warning.target_user_id, 'An admin has cleared your flagged message. Chat access is active again.']
     );
 
     await client.query("COMMIT");
@@ -1954,6 +2148,93 @@ app.post("/admin/chat/unflag", async (req, res) => {
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("Admin Chat Unflag Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/admin/chat/reject-appeal", async (req, res) => {
+  const adminEmail = normalizeEmail(req.body.adminEmail);
+  const warningId = req.body.warningId || null;
+  const messageId = req.body.messageId || null;
+  const resolutionNote = String(req.body.resolutionNote || "Appeal rejected by admin").trim();
+  const freezeHours = Number(req.body.freezeHours || 24);
+
+  if ((!warningId && !messageId) || freezeHours <= 0) {
+    return res.status(400).json({ error: "Warning/message reference and a valid freeze duration are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const admin = await ensureAdminUser(adminEmail);
+    if (!admin) {
+      return res.status(403).json({ error: "Only admin accounts can reject appeals" });
+    }
+
+    await client.query("BEGIN");
+    const warningResult = warningId
+      ? await client.query(
+          `SELECT id, target_user_id, message_id
+           FROM admin_warnings
+           WHERE id = $1
+           LIMIT 1`,
+          [warningId]
+        )
+      : await client.query(
+          `SELECT id, target_user_id, message_id
+           FROM admin_warnings
+           WHERE message_id = $1
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [messageId]
+        );
+
+    const warning = warningResult.rows[0];
+    if (!warning) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Warning record not found" });
+    }
+
+    await client.query(
+      `UPDATE admin_warnings
+       SET appeal_status = 'rejected',
+           freeze_duration_hours = $2,
+           freeze_until = NOW() + ($2 * INTERVAL '1 hour'),
+           resolved_at = NOW(),
+           resolution_note = $3
+       WHERE id = $1`,
+      [warning.id, freezeHours, resolutionNote]
+    );
+
+    await client.query(
+      `UPDATE users
+       SET is_chat_frozen = true,
+           chat_frozen_at = NOW(),
+           chat_freeze_reason = $2,
+           chat_freeze_expires_at = NOW() + ($3 * INTERVAL '1 hour')
+       WHERE id = $1`,
+      [
+        warning.target_user_id,
+        `Appeal rejected by admin. Chat access frozen for ${freezeHours} hour(s).`,
+        freezeHours,
+      ]
+    );
+
+    await client.query(
+      `INSERT INTO notifications (user_id, title, message, type, is_read)
+       VALUES ($1, 'Appeal rejected', $2, 'appeal_update', false)`,
+      [
+        warning.target_user_id,
+        `Your appeal was rejected. Chat access has been frozen for ${freezeHours} hour(s).`,
+      ]
+    );
+
+    await client.query("COMMIT");
+    res.status(200).json({ ok: true });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Reject Chat Appeal Error:", e);
     res.status(500).json({ error: e.message });
   } finally {
     client.release();
@@ -2008,6 +2289,8 @@ app.get("/chat/appeals/:email", async (req, res) => {
               aw.appeal_message,
               aw.appeal_submitted_at,
               aw.appeal_deadline_at,
+              aw.freeze_duration_hours,
+              aw.freeze_until,
               aw.created_at,
               aw.resolved_at,
               aw.resolution_note,
