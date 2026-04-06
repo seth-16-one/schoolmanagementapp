@@ -376,9 +376,12 @@ async function loginUserFromUsersTable(usernameOrEmail, password, enforcedRole =
 
 // Register - Student / Teacher / Parent approval requests
 app.post("/register", async (req, res) => {
-  const { username, email, password, role } = req.body;
+  const { username, email, password, role, full_name, phone } = req.body;
   const normalizedEmail = normalizeEmail(email);
   const normalizedRole = String(role || "student").toLowerCase().trim();
+  const normalizedUsername = String(username || "").trim();
+  const normalizedFullName = String(full_name || "").trim();
+  const normalizedPhone = String(phone || "").trim();
   const allowedRoles = new Set(["student", "teacher", "parent"]);
 
   if (!username || !email || !password) {
@@ -396,10 +399,17 @@ app.post("/register", async (req, res) => {
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      `INSERT INTO registration (username, email, password, role)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, username, email, role, approved`,
-      [username, normalizedEmail, hashedPassword, normalizedRole]
+      `INSERT INTO registration (username, email, password_hash, role, full_name, phone)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, username, email, role, approved, full_name, phone`,
+      [
+        normalizedUsername,
+        normalizedEmail,
+        hashedPassword,
+        normalizedRole,
+        normalizedFullName || null,
+        normalizedPhone || null,
+      ]
     );
 
     console.log(`New ${normalizedRole} registration: ${normalizedEmail}`);
@@ -1337,6 +1347,9 @@ app.get("/notifications/:email", async (req, res) => {
               title,
               message,
               type,
+              sender_user_id,
+              sender_role,
+              audience,
               is_read,
               created_at
        FROM notifications
@@ -1371,6 +1384,76 @@ app.put("/notifications/:id/read", async (req, res) => {
   } catch (e) {
     console.error("Mark Notification Read Error:", e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/admin/notifications/broadcast", async (req, res) => {
+  const adminEmail = normalizeEmail(req.body.adminEmail);
+  const title = String(req.body.title || "").trim();
+  const message = String(req.body.message || "").trim();
+  const type = String(req.body.type || "announcement").trim().toLowerCase();
+  const audience = String(req.body.audience || "all").trim().toLowerCase();
+
+  if (!title || !message) {
+    return res.status(400).json({ error: "Title and message are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const admin = await ensureAdminUser(adminEmail);
+    if (!admin) {
+      return res.status(403).json({ error: "Only admin accounts can broadcast notifications" });
+    }
+
+    await client.query("BEGIN");
+
+    const usersResult = await client.query(
+      audience === 'all'
+        ? `SELECT id, role FROM users WHERE id <> $1`
+        : `SELECT id, role FROM users WHERE id <> $1 AND role = $2`,
+      audience === 'all' ? [admin.id] : [admin.id, audience]
+    );
+
+    for (const user of usersResult.rows) {
+      await client.query(
+        `INSERT INTO notifications (
+           user_id,
+           title,
+           message,
+           type,
+           sender_user_id,
+           sender_role,
+           audience,
+           is_read
+         )
+         VALUES ($1, $2, $3, $4, $5, 'admin', $6, false)`,
+        [user.id, title, message, type, admin.id, audience]
+      );
+    }
+
+    await client.query(
+      `INSERT INTO notifications (
+         user_id,
+         title,
+         message,
+         type,
+         sender_user_id,
+         sender_role,
+         audience,
+         is_read
+       )
+       VALUES ($1, $2, $3, 'system', $1, 'admin', $4, false)`,
+      [admin.id, 'Broadcast sent', `Your message "${title}" was sent to ${usersResult.rows.length} user(s).`, audience]
+    );
+
+    await client.query("COMMIT");
+    res.status(201).json({ ok: true, recipients: usersResult.rows.length });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Admin Broadcast Notification Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
   }
 });
 
