@@ -467,6 +467,19 @@ async function getChatContactProfile(email) {
   return result.rows[0] || null;
 }
 
+async function areUsersBlocked(actorId, peerId) {
+  if (!actorId || !peerId) return false;
+  const result = await pool.query(
+    `SELECT 1
+     FROM blocked_users
+     WHERE blocker_user_id = $1
+       AND blocked_user_id = $2
+     LIMIT 1`,
+    [actorId, peerId]
+  );
+  return result.rows.length > 0;
+}
+
 async function getNextStudentAdmissionNumber(client = pool) {
   await client.query(`SELECT pg_advisory_xact_lock(11000)`);
   await client.query(
@@ -1775,6 +1788,62 @@ app.put("/student-profile/:email", async (req, res) => {
   }
 });
 
+app.post("/student-profile/:email/photo", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  const profilePictureUrl = String(req.body.profile_picture_url || "").trim();
+
+  if (!profilePictureUrl) {
+    return res.status(400).json({ error: "A profile picture is required" });
+  }
+
+  try {
+    const userResult = await pool.query(
+      "SELECT id, role FROM users WHERE email = $1 LIMIT 1",
+      [email]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const user = userResult.rows[0];
+    if (user.role !== "student") {
+      return res.status(403).json({ error: "Only student accounts can update this profile" });
+    }
+
+    const result = await pool.query(
+      `UPDATE students
+       SET profile_picture_url = $2,
+           updated_at = NOW()
+       WHERE user_id = $1
+       RETURNING id`,
+      [user.id, profilePictureUrl]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Student profile not found" });
+    }
+
+    const profileResult = await pool.query(`
+      SELECT s.full_name, s.class_name, s.admission_number, u.email, s.phone,
+             s.gender, s.date_of_birth, s.address, s.profile_picture_url,
+             s.profile_locked, s.updated_at,
+             (SELECT COUNT(*) FROM attendance WHERE student_id = s.id AND status = 'present') * 100.0 /
+             NULLIF((SELECT COUNT(*) FROM attendance WHERE student_id = s.id), 0) as attendance_percentage
+      FROM students s
+      JOIN users u ON s.user_id = u.id
+      WHERE s.id = $1
+      LIMIT 1`,
+      [result.rows[0].id]
+    );
+
+    return res.json(profileResult.rows[0]);
+  } catch (e) {
+    console.error("Update Student Profile Photo Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/exams/:studentEmail", async (req, res) => {
   const { studentEmail } = req.params;
   try {
@@ -2288,6 +2357,7 @@ app.get("/login-sessions/:email", async (req, res) => {
       `SELECT id,
               role,
               ip_address,
+              NULL::text AS location,
               device_info,
               suspicious,
               logged_in_at,
@@ -2330,6 +2400,37 @@ app.post("/login-sessions/logout-others", async (req, res) => {
     return res.json({ success: true, count: result.rows.length });
   } catch (e) {
     console.error("Logout Other Devices Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/login-sessions/logout-one", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const sessionId = String(req.body.sessionId || "").trim();
+  try {
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId is required" });
+    }
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `UPDATE login_sessions
+       SET logged_out_at = NOW(),
+           is_current = false
+       WHERE id::text = $1
+         AND user_id = $2
+         AND logged_out_at IS NULL
+         AND is_current = false
+       RETURNING id`,
+      [sessionId, user.id]
+    );
+
+    return res.json({ success: true, count: result.rows.length });
+  } catch (e) {
+    console.error("Logout Single Device Error:", e);
     return res.status(500).json({ error: e.message });
   }
 });
@@ -3871,10 +3972,125 @@ app.get("/chat/contact-profile/:email", async (req, res) => {
     if (!profile) {
       return res.status(404).json({ error: "Contact not found" });
     }
+    const viewerEmail = normalizeEmail(req.query.viewerEmail);
+    if (viewerEmail) {
+      const viewer = await getUserByEmail(viewerEmail);
+      if (viewer) {
+        profile.is_blocked_by_me = await areUsersBlocked(viewer.id, profile.id);
+      }
+    }
 
     res.json(profile);
   } catch (e) {
     console.error("Chat Contact Profile Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/contacts/unfriend", async (req, res) => {
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const peerEmail = normalizeEmail(req.body.peerEmail);
+  try {
+    const actor = await getUserByEmail(actorEmail);
+    const peer = await getUserByEmail(peerEmail);
+    if (!actor || !peer) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    await pool.query(
+      `DELETE FROM friend_requests
+       WHERE status = 'accepted'
+         AND ((sender_id = $1 AND receiver_id = $2) OR (sender_id = $2 AND receiver_id = $1))`,
+      [actor.id, peer.id]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Unfriend Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/contacts/block", async (req, res) => {
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const peerEmail = normalizeEmail(req.body.peerEmail);
+  const reason = String(req.body.reason || "").trim();
+  try {
+    const actor = await getUserByEmail(actorEmail);
+    const peer = await getUserByEmail(peerEmail);
+    if (!actor || !peer) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    await pool.query(
+      `INSERT INTO blocked_users (blocker_user_id, blocked_user_id)
+       VALUES ($1, $2)
+       ON CONFLICT (blocker_user_id, blocked_user_id) DO NOTHING`,
+      [actor.id, peer.id]
+    );
+    const admins = await pool.query(`SELECT id FROM users WHERE role = 'admin'`);
+    for (const admin of admins.rows) {
+      await pool.query(
+        `INSERT INTO notifications (user_id, title, message, type, is_read, created_at)
+         VALUES ($1, $2, $3, 'user_block', false, NOW())`,
+        [
+          admin.id,
+          "Student blocked a contact",
+          `${actor.email} blocked ${peer.email}${reason ? `: ${reason}` : "."}`,
+        ]
+      );
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Block User Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/contacts/unblock", async (req, res) => {
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const peerEmail = normalizeEmail(req.body.peerEmail);
+  try {
+    const actor = await getUserByEmail(actorEmail);
+    const peer = await getUserByEmail(peerEmail);
+    if (!actor || !peer) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    await pool.query(
+      `DELETE FROM blocked_users
+       WHERE blocker_user_id = $1
+         AND blocked_user_id = $2`,
+      [actor.id, peer.id]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Unblock User Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/contacts/report", async (req, res) => {
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const peerEmail = normalizeEmail(req.body.peerEmail);
+  const reason = String(req.body.reason || "").trim();
+  try {
+    const actor = await getUserByEmail(actorEmail);
+    const peer = await getUserByEmail(peerEmail);
+    if (!actor || !peer) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    const admins = await pool.query(`SELECT id FROM users WHERE role = 'admin'`);
+    for (const admin of admins.rows) {
+      await pool.query(
+        `INSERT INTO notifications (user_id, title, message, type, is_read, created_at)
+         VALUES ($1, $2, $3, 'user_report', false, NOW())`,
+        [
+          admin.id,
+          "Student report submitted",
+          `${actor.email} reported ${peer.email}${reason ? `: ${reason}` : "."}`,
+        ]
+      );
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Report User Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
