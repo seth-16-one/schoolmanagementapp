@@ -382,6 +382,31 @@ async function getGroupMembership(groupId, userId, client = pool) {
   return result.rows[0] || null;
 }
 
+function slugMeetingPart(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24) || "room";
+}
+
+function buildJitsiRoomName(prefix, parts = []) {
+  const stamp = Date.now().toString(36);
+  return ["eschool", prefix, ...parts.map(slugMeetingPart).filter(Boolean), stamp]
+    .join("-")
+    .slice(0, 120);
+}
+
+function buildJitsiRoomUrl(roomName, callType = "video") {
+  const hash =
+    callType === "voice"
+      ? "#config.startWithVideoMuted=true&config.prejoinConfig.enabled=true"
+      : "#config.prejoinConfig.enabled=true";
+  return `https://meet.jit.si/${roomName}${hash}`;
+}
+
 function canManageGroupMembers(membership) {
   if (!membership) return false;
   return membership.is_admin === true || membership.role === 'admin' || membership.role === 'moderator';
@@ -3255,6 +3280,16 @@ app.post("/calls/initiate", async (req, res) => {
            AND cgm.user_id <> $2`,
         [groupId, caller.id]
       );
+      const groupInfo = await pool.query(
+        `SELECT name FROM chat_groups WHERE id = $1 LIMIT 1`,
+        [groupId]
+      );
+      const groupName = groupInfo.rows[0]?.name || "group";
+      const roomName = buildJitsiRoomName(
+        callType === "video" ? "group-video" : "group-voice",
+        [groupName, groupId]
+      );
+      const roomUrl = buildJitsiRoomUrl(roomName, callType);
 
       for (const member of membersResult.rows) {
         await pool.query(
@@ -3263,7 +3298,7 @@ app.post("/calls/initiate", async (req, res) => {
           [
             member.user_id,
             callType === 'video' ? 'Incoming group video call' : 'Incoming group voice call',
-            `${caller.username || caller.email} started a ${callType} call in your group.`,
+            `${caller.username || caller.email} started a ${callType} call in your group. Join here: ${roomUrl}`,
           ]
         );
       }
@@ -3272,6 +3307,8 @@ app.post("/calls/initiate", async (req, res) => {
         ok: true,
         call_type: callType,
         group_id: groupId,
+        room_name: roomName,
+        room_url: roomUrl,
       });
     }
 
@@ -3284,6 +3321,14 @@ app.post("/calls/initiate", async (req, res) => {
     if (!canChat) {
       return res.status(403).json({ error: "You must be allowed to chat before calling" });
     }
+    const roomName = buildJitsiRoomName(
+      callType === "video" ? "video" : "voice",
+      [
+        caller.email ? caller.email.split("@")[0] : "caller",
+        recipient.email ? recipient.email.split("@")[0] : "recipient",
+      ]
+    );
+    const roomUrl = buildJitsiRoomUrl(roomName, callType);
 
     await pool.query(
       `INSERT INTO notifications (user_id, title, message, type, is_read)
@@ -3291,7 +3336,7 @@ app.post("/calls/initiate", async (req, res) => {
       [
         recipient.id,
         callType === 'video' ? 'Incoming video call' : 'Incoming voice call',
-        `${caller.username || caller.email} is calling you.`,
+        `${caller.username || caller.email} is calling you. Join here: ${roomUrl}`,
       ]
     );
 
@@ -3299,6 +3344,8 @@ app.post("/calls/initiate", async (req, res) => {
       ok: true,
       call_type: callType,
       recipient_id: recipient.id,
+      room_name: roomName,
+      room_url: roomUrl,
     });
   } catch (e) {
     console.error("Call Initiation Error:", e);
@@ -5046,26 +5093,153 @@ app.get("/attendance/class/:teacherEmail", async (req, res) => {
 });
 
 app.post("/live-classes/create", async (req, res) => {
-  const { teacherEmail, title, subjectId, className, meetingLink, classTime } = req.body;
+  const {
+    teacherEmail,
+    hostEmail,
+    title,
+    subjectId,
+    className,
+    meetingLink,
+    classTime
+  } = req.body;
+  const resolvedHostEmail = normalizeEmail(hostEmail || teacherEmail);
 
-  if (!teacherEmail || !title || !meetingLink || !classTime) {
+  if (!resolvedHostEmail || !title || !meetingLink || !classTime) {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
   try {
-    const teacher = await pool.query("SELECT id FROM users WHERE email = $1 AND role = 'teacher'", [teacherEmail]);
-    if (teacher.rows.length === 0) return res.status(403).json({ error: "Unauthorized" });
+    const hostUser = await pool.query(
+      "SELECT id, role FROM users WHERE email = $1 LIMIT 1",
+      [resolvedHostEmail]
+    );
+    if (hostUser.rows.length === 0) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+
+    const user = hostUser.rows[0];
+    let teacherId = null;
+    let resolvedClassName = className || null;
+
+    if (user.role === 'teacher') {
+      const teacher = await pool.query(
+        "SELECT id, class_name FROM teachers WHERE user_id = $1 LIMIT 1",
+        [user.id]
+      );
+      if (teacher.rows.length === 0) {
+        return res.status(403).json({ error: "Teacher profile not found" });
+      }
+      teacherId = teacher.rows[0].id;
+      resolvedClassName = resolvedClassName || teacher.rows[0].class_name || null;
+    } else if (user.role === 'student') {
+      const student = await pool.query(
+        "SELECT class_name FROM students WHERE user_id = $1 LIMIT 1",
+        [user.id]
+      );
+      if (student.rows.length === 0) {
+        return res.status(403).json({ error: "Student profile not found" });
+      }
+      resolvedClassName = resolvedClassName || student.rows[0].class_name || null;
+    } else {
+      return res.status(403).json({ error: "Only teachers and students can create live classes" });
+    }
 
     const result = await pool.query(
       `INSERT INTO live_classes (teacher_id, title, subject_id, meeting_link, class_time, class_name)
-       VALUES ((SELECT id FROM teachers WHERE user_id = (SELECT id FROM users WHERE email = $1)), $2, $3, $4, $5, $6)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [teacherEmail, title, subjectId || null, meetingLink, classTime, className || null]
+      [teacherId, title, subjectId || null, meetingLink, classTime, resolvedClassName]
     );
 
     res.status(201).json(result.rows[0]);
   } catch (e) {
     console.error("Create Live Class Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/live-classes/:id/join", async (req, res) => {
+  const liveClassId = req.params.id;
+  const studentEmail = normalizeEmail(req.body.studentEmail);
+
+  if (!liveClassId || !studentEmail) {
+    return res.status(400).json({ error: "Live class id and student email are required" });
+  }
+
+  try {
+    const studentResult = await pool.query(
+      `SELECT s.id, s.class_name, s.full_name, u.id AS user_id
+       FROM students s
+       JOIN users u ON u.id = s.user_id
+       WHERE u.email = $1
+       LIMIT 1`,
+      [studentEmail]
+    );
+
+    if (studentResult.rows.length === 0) {
+      return res.status(404).json({ error: "Student not found" });
+    }
+
+    const liveClassResult = await pool.query(
+      `SELECT id, teacher_id, class_name, class_time, title
+       FROM live_classes
+       WHERE id = $1
+       LIMIT 1`,
+      [liveClassId]
+    );
+
+    if (liveClassResult.rows.length === 0) {
+      return res.status(404).json({ error: "Live class not found" });
+    }
+
+    const student = studentResult.rows[0];
+    const liveClass = liveClassResult.rows[0];
+
+    if (
+      liveClass.class_name &&
+      String(liveClass.class_name).trim() !== "" &&
+      String(student.class_name || "").trim().toLowerCase() !==
+        String(liveClass.class_name || "").trim().toLowerCase()
+    ) {
+      return res.status(403).json({ error: "This live class does not belong to the student's class" });
+    }
+
+    if (!liveClass.teacher_id) {
+      return res.status(200).json({
+        ok: true,
+        counts_for_attendance: false,
+        live_class_id: liveClass.id,
+      });
+    }
+
+    const attendanceDate = (() => {
+      const parsed = liveClass.class_time ? new Date(liveClass.class_time) : new Date();
+      const y = parsed.getUTCFullYear();
+      const m = String(parsed.getUTCMonth() + 1).padStart(2, "0");
+      const d = String(parsed.getUTCDate()).padStart(2, "0");
+      return `${y}-${m}-${d}`;
+    })();
+
+    const attendanceResult = await pool.query(
+      `INSERT INTO attendance (student_id, date, status)
+       VALUES ($1, $2, 'present')
+       ON CONFLICT (student_id, date)
+       DO UPDATE SET status = CASE
+         WHEN attendance.status = 'absent' THEN 'present'
+         ELSE attendance.status
+       END
+       RETURNING id, student_id, date, status`,
+      [student.id, attendanceDate]
+    );
+
+    return res.status(200).json({
+      ok: true,
+      counts_for_attendance: true,
+      live_class_id: liveClass.id,
+      attendance: attendanceResult.rows[0],
+    });
+  } catch (e) {
+    console.error("Join Live Class Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
