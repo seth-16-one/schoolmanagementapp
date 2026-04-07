@@ -185,6 +185,32 @@ function readTypingState(senderId, receiverId) {
   return entry;
 }
 
+async function insertGroupSystemMessage({
+  client = pool,
+  groupId,
+  actorId,
+  actorRole = "system",
+  message,
+}) {
+  if (!groupId || !actorId || !String(message || "").trim()) {
+    return;
+  }
+
+  await client.query(
+    `INSERT INTO messages (
+       sender_id,
+       receiver_id,
+       group_id,
+       message,
+       is_read,
+       sender_role,
+       message_type
+     )
+     VALUES ($1, NULL, $2, $3, true, $4, 'system')`,
+    [actorId, groupId, String(message).trim(), actorRole]
+  );
+}
+
 function buildChatFreezeMessage(reason) {
   return reason || "Chat access has been frozen. Please contact the school admin.";
 }
@@ -4091,6 +4117,25 @@ app.post("/chat/thread/send", async (req, res) => {
       return res.status(400).json({ error: "Message text or media is required" });
     }
 
+    if (clientMessageId) {
+      const existing = await pool.query(
+        `SELECT id, sender_id, receiver_id, message, sender_role, created_at, is_read,
+                delivered_at, read_at, message_type, media_url, thumbnail_url,
+                duration_seconds, client_message_id, reply_to_message_id,
+                forwarded_from_message_id, is_pinned, pinned_at, reactions
+         FROM messages
+         WHERE group_id IS NULL
+           AND sender_id = $1
+           AND receiver_id = $2
+           AND client_message_id = $3
+         LIMIT 1`,
+        [sender.id, receiver.id, clientMessageId]
+      );
+      if (existing.rows.length > 0) {
+        return res.status(200).json(existing.rows[0]);
+      }
+    }
+
     const result = await pool.query(
       `INSERT INTO messages (
          sender_id,
@@ -4424,6 +4469,41 @@ app.post("/chat/messages/:messageId/pin", async (req, res) => {
   }
 });
 
+app.delete("/chat/messages/:messageId", async (req, res) => {
+  const messageId = req.params.messageId;
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+
+  try {
+    const actor = await getUserByEmail(actorEmail);
+    if (!actor) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const messageResult = await pool.query(
+      `SELECT id, sender_id
+       FROM messages
+       WHERE id = $1
+       LIMIT 1`,
+      [messageId]
+    );
+
+    if (messageResult.rows.length === 0) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+
+    const message = messageResult.rows[0];
+    if (message.sender_id !== actor.id) {
+      return res.status(403).json({ error: "Only the sender can delete this message" });
+    }
+
+    await pool.query(`DELETE FROM messages WHERE id = $1`, [messageId]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Delete Message Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/chat/groups/:email", async (req, res) => {
   const email = normalizeEmail(req.params.email);
   try {
@@ -4510,6 +4590,13 @@ app.post("/chat/groups", async (req, res) => {
         [group.id, member.id, member.id === creator.id, role]
       );
     }
+    await insertGroupSystemMessage({
+      client,
+      groupId: group.id,
+      actorId: creator.id,
+      actorRole: creator.role,
+      message: `${creator.email} created the group`,
+    });
     await client.query("COMMIT");
 
     res.status(201).json(group);
@@ -4554,12 +4641,26 @@ app.post("/chat/groups/:groupId/add-members", async (req, res) => {
     );
 
     for (const member of members.rows) {
+      const addedUser = await client.query(
+        `SELECT email FROM users WHERE id = $1 LIMIT 1`,
+        [member.id]
+      );
       await client.query(
         `INSERT INTO chat_group_members (group_id, user_id, is_admin, role)
          VALUES ($1, $2, false, 'member')
          ON CONFLICT (group_id, user_id) DO NOTHING`,
         [groupId, member.id]
       );
+      const addedEmail = addedUser.rows[0]?.email;
+      if (addedEmail) {
+        await insertGroupSystemMessage({
+          client,
+          groupId,
+          actorId: actor.id,
+          actorRole: actor.role,
+          message: `${actor.email} added ${addedEmail}`,
+        });
+      }
     }
 
     res.json({ ok: true, added: members.rows.length });
@@ -4703,6 +4804,21 @@ app.post("/chat/groups/:groupId/messages", async (req, res) => {
 
     if (!message.trim() && !mediaUrl) {
       return res.status(400).json({ error: "Message text or media is required" });
+    }
+
+    if (clientMessageId) {
+      const existing = await pool.query(
+        `SELECT *
+         FROM messages
+         WHERE group_id = $1
+           AND sender_id = $2
+           AND client_message_id = $3
+         LIMIT 1`,
+        [groupId, sender.id, clientMessageId]
+      );
+      if (existing.rows.length > 0) {
+        return res.status(200).json(existing.rows[0]);
+      }
     }
 
     const result = await pool.query(
@@ -4870,6 +4986,16 @@ app.patch("/chat/groups/:groupId/members/:memberEmail/role", async (req, res) =>
        RETURNING group_id, user_id, is_admin, role`,
       [groupId, member.id, nextRole]
     );
+    await insertGroupSystemMessage({
+      client,
+      groupId,
+      actorId: actor.id,
+      actorRole: actor.role,
+      message:
+        nextRole === "moderator"
+          ? `${actor.email} promoted ${member.email} to moderator`
+          : `${actor.email} changed ${member.email} to member`,
+    });
 
     res.json(updated.rows[0]);
   } catch (e) {
@@ -4958,6 +5084,13 @@ app.delete("/chat/groups/:groupId/members/:memberEmail", async (req, res) => {
        WHERE group_id = $1 AND user_id = $2`,
       [groupId, member.id]
     );
+    await insertGroupSystemMessage({
+      client,
+      groupId,
+      actorId: actor.id,
+      actorRole: actor.role,
+      message: `${actor.email} removed ${member.email}`,
+    });
 
     res.json({ ok: true });
   } catch (e) {
@@ -5204,17 +5337,9 @@ app.post("/live-classes/:id/join", async (req, res) => {
       return res.status(403).json({ error: "This live class does not belong to the student's class" });
     }
 
-    if (!liveClass.teacher_id) {
-      return res.status(200).json({
-        ok: true,
-        counts_for_attendance: false,
-        live_class_id: liveClass.id,
-      });
-    }
-
-    const attendanceDate = (() => {
-      const parsed = liveClass.class_time ? new Date(liveClass.class_time) : new Date();
-      const y = parsed.getUTCFullYear();
+      const attendanceDate = (() => {
+        const parsed = liveClass.class_time ? new Date(liveClass.class_time) : new Date();
+        const y = parsed.getUTCFullYear();
       const m = String(parsed.getUTCMonth() + 1).padStart(2, "0");
       const d = String(parsed.getUTCDate()).padStart(2, "0");
       return `${y}-${m}-${d}`;
@@ -5232,12 +5357,13 @@ app.post("/live-classes/:id/join", async (req, res) => {
       [student.id, attendanceDate]
     );
 
-    return res.status(200).json({
-      ok: true,
-      counts_for_attendance: true,
-      live_class_id: liveClass.id,
-      attendance: attendanceResult.rows[0],
-    });
+      return res.status(200).json({
+        ok: true,
+        counts_for_attendance: true,
+        host_type: liveClass.teacher_id ? "teacher" : "student",
+        live_class_id: liveClass.id,
+        attendance: attendanceResult.rows[0],
+      });
   } catch (e) {
     console.error("Join Live Class Error:", e);
     res.status(500).json({ error: e.message });
