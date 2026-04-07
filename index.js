@@ -982,7 +982,7 @@ app.post("/approve-registration/:id", async (req, res) => {
 
     if (role === 'student') {
       const existingStudent = await client.query(
-        `SELECT admission_number
+        `SELECT admission_number, class_name
          FROM students
          WHERE user_id = $1
          LIMIT 1`,
@@ -993,13 +993,17 @@ app.post("/approve-registration/:id", async (req, res) => {
         await getNextStudentAdmissionNumber(client);
 
       await client.query(
-        `INSERT INTO students (user_id, admission_number, full_name, phone)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO students (user_id, admission_number, full_name, phone, profile_locked)
+         VALUES ($1, $2, $3, $4, false)
          ON CONFLICT (user_id)
          DO UPDATE SET
            admission_number = EXCLUDED.admission_number,
            full_name = EXCLUDED.full_name,
            phone = EXCLUDED.phone,
+           profile_locked = CASE
+             WHEN COALESCE(students.class_name, '') = '' THEN false
+             ELSE students.profile_locked
+           END,
            updated_at = NOW()`,
         [userId, admissionNumber, fullName, phone]
       );
@@ -1525,13 +1529,26 @@ app.put("/student-profile/:email", async (req, res) => {
     }
 
     const existingProfile = await pool.query(
-      "SELECT id, profile_locked, full_name, admission_number, profile_picture_url FROM students WHERE user_id = $1 LIMIT 1",
+      `SELECT id,
+              profile_locked,
+              full_name,
+              admission_number,
+              class_name,
+              profile_picture_url
+       FROM students
+       WHERE user_id = $1
+       LIMIT 1`,
       [user.id]
     );
+
+    const isInitialProfileCompletion =
+      existingProfile.rows.length === 0 ||
+      !String(existingProfile.rows[0].class_name || "").trim();
 
     if (
       existingProfile.rows.length > 0 &&
       existingProfile.rows[0].profile_locked === true &&
+      !isInitialProfileCompletion &&
       !hasAdminOverride
     ) {
       return res.status(403).json({
