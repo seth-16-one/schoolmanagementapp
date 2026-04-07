@@ -149,8 +149,10 @@ async function syncChatFreezeForUser(userId) {
             aw.reason,
             aw.status,
             aw.appeal_status,
+            aw.appeal_message,
             aw.appeal_deadline_at,
             aw.freeze_until,
+            aw.resolution_note,
             aw.created_at
      FROM admin_warnings aw
      WHERE aw.target_user_id = $1
@@ -2181,6 +2183,30 @@ app.put("/notifications/:id/read", async (req, res) => {
   }
 });
 
+app.put("/notifications/:email/read-all", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `UPDATE notifications
+       SET is_read = true
+       WHERE user_id = $1
+         AND COALESCE(is_read, false) = false
+       RETURNING id`,
+      [user.id]
+    );
+
+    res.json({ success: true, count: result.rows.length });
+  } catch (e) {
+    console.error("Mark All Notifications Read Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/admin/notifications/broadcast", async (req, res) => {
   const adminEmail = normalizeEmail(req.body.adminEmail);
   const title = String(req.body.title || "").trim();
@@ -2691,6 +2717,9 @@ app.get("/chat/access/:email", async (req, res) => {
             appeal_status: warning.appeal_status,
             appeal_deadline_at: warning.appeal_deadline_at,
             created_at: warning.created_at,
+            freeze_until: warning.freeze_until || null,
+            resolution_note: warning.resolution_note || null,
+            appeal_message: warning.appeal_message || null,
           }
         : null,
     });
@@ -3503,8 +3532,9 @@ app.get("/student/parents/:studentEmail", async (req, res) => {
 app.get("/chat/thread/:email/:peerEmail", async (req, res) => {
   const email = normalizeEmail(req.params.email);
   const peerEmail = normalizeEmail(req.params.peerEmail);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 40, 1), 80);
+  const before = req.query.before ? new Date(req.query.before) : null;
   try {
-    await ensureChatMessageFeatureSchema();
     const user = await getUserByEmail(email);
     const peer = await getUserByEmail(peerEmail);
     if (!user || !peer) {
@@ -3531,10 +3561,12 @@ app.get("/chat/thread/:email/:peerEmail", async (req, res) => {
     );
 
     const result = await pool.query(
-      `SELECT m.id,
-              m.sender_id,
-              m.receiver_id,
-              sender_user.email AS sender_email,
+      `SELECT *
+       FROM (
+         SELECT m.id,
+               m.sender_id,
+               m.receiver_id,
+               sender_user.email AS sender_email,
               m.message,
               m.sender_role,
               m.created_at,
@@ -3554,23 +3586,32 @@ app.get("/chat/thread/:email/:peerEmail", async (req, res) => {
               reply.message AS reply_message,
               reply.message_type AS reply_message_type,
               reply_sender.email AS reply_sender_email,
-              COALESCE(reply_student.full_name, reply_teacher.full_name, reply_parent.full_name, reply_admin.full_name, reply_sender.username, reply_sender.email) AS reply_sender_name
-       FROM messages m
-       JOIN users sender_user ON sender_user.id = m.sender_id
-       LEFT JOIN messages reply ON reply.id = m.reply_to_message_id
-       LEFT JOIN users reply_sender ON reply_sender.id = reply.sender_id
-       LEFT JOIN students reply_student ON reply_student.user_id = reply_sender.id
-       LEFT JOIN teachers reply_teacher ON reply_teacher.user_id = reply_sender.id
-       LEFT JOIN parents reply_parent ON reply_parent.user_id = reply_sender.id
-       LEFT JOIN admins reply_admin ON reply_admin.user_id = reply_sender.id
-       WHERE m.group_id IS NULL
-         AND (
-           (m.sender_id = $1 AND m.receiver_id = $2)
-           OR
-           (m.sender_id = $2 AND m.receiver_id = $1)
-         )
-       ORDER BY m.created_at ASC`,
-      [user.id, peer.id]
+               COALESCE(reply_student.full_name, reply_teacher.full_name, reply_parent.full_name, reply_admin.full_name, reply_sender.username, reply_sender.email) AS reply_sender_name
+         FROM messages m
+         JOIN users sender_user ON sender_user.id = m.sender_id
+         LEFT JOIN messages reply ON reply.id = m.reply_to_message_id
+         LEFT JOIN users reply_sender ON reply_sender.id = reply.sender_id
+         LEFT JOIN students reply_student ON reply_student.user_id = reply_sender.id
+         LEFT JOIN teachers reply_teacher ON reply_teacher.user_id = reply_sender.id
+         LEFT JOIN parents reply_parent ON reply_parent.user_id = reply_sender.id
+         LEFT JOIN admins reply_admin ON reply_admin.user_id = reply_sender.id
+         WHERE m.group_id IS NULL
+           AND (
+             (m.sender_id = $1 AND m.receiver_id = $2)
+             OR
+             (m.sender_id = $2 AND m.receiver_id = $1)
+           )
+           AND ($3::timestamp IS NULL OR m.created_at < $3)
+         ORDER BY m.created_at DESC
+         LIMIT $4
+       ) recent_messages
+       ORDER BY created_at ASC`,
+      [
+        user.id,
+        peer.id,
+        before && !Number.isNaN(before.getTime()) ? before.toISOString() : null,
+        limit,
+      ]
     );
 
     res.json(result.rows);
@@ -3982,8 +4023,9 @@ app.post("/chat/groups/:groupId/add-members", async (req, res) => {
 app.get("/chat/groups/:groupId/messages/:email", async (req, res) => {
   const groupId = req.params.groupId;
   const email = normalizeEmail(req.params.email);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 40, 1), 80);
+  const before = req.query.before ? new Date(req.query.before) : null;
   try {
-    await ensureChatMessageFeatureSchema();
     const user = await getUserByEmail(email);
     if (!user) {
       return res.status(404).json({ error: "User not found" });
@@ -4006,7 +4048,9 @@ app.get("/chat/groups/:groupId/messages/:email", async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT m.id,
+      `SELECT *
+       FROM (
+         SELECT m.id,
               m.group_id,
               m.sender_id,
               u.email AS sender_email,
@@ -4028,21 +4072,29 @@ app.get("/chat/groups/:groupId/messages/:email", async (req, res) => {
               reply.message_type AS reply_message_type,
               reply_sender.email AS reply_sender_email,
               COALESCE(rs.full_name, rt.full_name, rp.full_name, ra.full_name, reply_sender.username, reply_sender.email) AS reply_sender_name
-       FROM messages m
-       JOIN users u ON u.id = m.sender_id
-       LEFT JOIN students s ON s.user_id = u.id
-       LEFT JOIN teachers t ON t.user_id = u.id
-       LEFT JOIN parents p ON p.user_id = u.id
-       LEFT JOIN admins a ON a.user_id = u.id
-       LEFT JOIN messages reply ON reply.id = m.reply_to_message_id
-       LEFT JOIN users reply_sender ON reply_sender.id = reply.sender_id
-       LEFT JOIN students rs ON rs.user_id = reply_sender.id
-       LEFT JOIN teachers rt ON rt.user_id = reply_sender.id
-       LEFT JOIN parents rp ON rp.user_id = reply_sender.id
-       LEFT JOIN admins ra ON ra.user_id = reply_sender.id
-       WHERE m.group_id = $1
-       ORDER BY m.created_at ASC`,
-      [groupId]
+         FROM messages m
+         JOIN users u ON u.id = m.sender_id
+         LEFT JOIN students s ON s.user_id = u.id
+         LEFT JOIN teachers t ON t.user_id = u.id
+         LEFT JOIN parents p ON p.user_id = u.id
+         LEFT JOIN admins a ON a.user_id = u.id
+         LEFT JOIN messages reply ON reply.id = m.reply_to_message_id
+         LEFT JOIN users reply_sender ON reply_sender.id = reply.sender_id
+         LEFT JOIN students rs ON rs.user_id = reply_sender.id
+         LEFT JOIN teachers rt ON rt.user_id = reply_sender.id
+         LEFT JOIN parents rp ON rp.user_id = reply_sender.id
+         LEFT JOIN admins ra ON ra.user_id = reply_sender.id
+         WHERE m.group_id = $1
+           AND ($2::timestamp IS NULL OR m.created_at < $2)
+         ORDER BY m.created_at DESC
+         LIMIT $3
+       ) recent_messages
+       ORDER BY created_at ASC`,
+      [
+        groupId,
+        before && !Number.isNaN(before.getTime()) ? before.toISOString() : null,
+        limit,
+      ]
     );
 
     res.json(result.rows);
