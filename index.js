@@ -343,6 +343,75 @@ async function ensureChatGroupRoleSchema(client = pool) {
   );
 }
 
+async function ensureChatMessageFeatureSchema(client = pool) {
+  await client.query(
+    `ALTER TABLE public.messages
+     ADD COLUMN IF NOT EXISTS reply_to_message_id uuid REFERENCES public.messages(id) ON DELETE SET NULL,
+     ADD COLUMN IF NOT EXISTS forwarded_from_message_id uuid REFERENCES public.messages(id) ON DELETE SET NULL,
+     ADD COLUMN IF NOT EXISTS is_pinned boolean DEFAULT false,
+     ADD COLUMN IF NOT EXISTS pinned_at timestamp without time zone,
+     ADD COLUMN IF NOT EXISTS reactions jsonb DEFAULT '{}'::jsonb`
+  );
+}
+
+function parseMessageReactions(rawValue) {
+  if (!rawValue) return {};
+  if (typeof rawValue === "object") {
+    return rawValue;
+  }
+
+  try {
+    return JSON.parse(String(rawValue));
+  } catch (_) {
+    return {};
+  }
+}
+
+function normalizeReactionState(rawValue) {
+  const parsed = parseMessageReactions(rawValue);
+  const normalized = {};
+  for (const [emoji, users] of Object.entries(parsed)) {
+    if (!emoji) continue;
+    const list = Array.isArray(users)
+      ? [...new Set(users.map((value) => normalizeEmail(value)).filter(Boolean))]
+      : [];
+    normalized[emoji] = list;
+  }
+  return normalized;
+}
+
+async function getChatContactProfile(email) {
+  const normalizedEmail = normalizeEmail(email);
+  const result = await pool.query(
+    `SELECT u.id,
+            u.email,
+            u.role,
+            u.username,
+            u.last_login,
+            COALESCE(s.full_name, t.full_name, p.full_name, a.full_name, u.username, u.email) AS full_name,
+            COALESCE(s.phone, t.phone, p.phone, a.phone) AS phone,
+            COALESCE(s.address, p.address) AS address,
+            s.gender,
+            s.date_of_birth,
+            s.class_name AS student_class_name,
+            s.admission_number,
+            t.class_name AS teacher_class_name,
+            t.teacher_number,
+            t.subject,
+            COALESCE(s.bio, t.bio, p.bio, a.bio) AS bio,
+            COALESCE(s.profile_picture_url, t.profile_picture_url, p.profile_picture_url, a.profile_picture_url) AS profile_picture_url
+     FROM users u
+     LEFT JOIN students s ON s.user_id = u.id
+     LEFT JOIN teachers t ON t.user_id = u.id
+     LEFT JOIN parents p ON p.user_id = u.id
+     LEFT JOIN admins a ON a.user_id = u.id
+     WHERE u.email = $1
+     LIMIT 1`,
+    [normalizedEmail]
+  );
+  return result.rows[0] || null;
+}
+
 async function getNextStudentAdmissionNumber(client = pool) {
   await client.query(`SELECT pg_advisory_xact_lock(11000)`);
   await client.query(
@@ -3435,6 +3504,7 @@ app.get("/chat/thread/:email/:peerEmail", async (req, res) => {
   const email = normalizeEmail(req.params.email);
   const peerEmail = normalizeEmail(req.params.peerEmail);
   try {
+    await ensureChatMessageFeatureSchema();
     const user = await getUserByEmail(email);
     const peer = await getUserByEmail(peerEmail);
     if (!user || !peer) {
@@ -3474,10 +3544,25 @@ app.get("/chat/thread/:email/:peerEmail", async (req, res) => {
               m.message_type,
               m.media_url,
               m.thumbnail_url,
-               m.duration_seconds,
-               m.client_message_id
+              m.duration_seconds,
+              m.client_message_id,
+              m.reply_to_message_id,
+              m.forwarded_from_message_id,
+              COALESCE(m.is_pinned, false) AS is_pinned,
+              m.pinned_at,
+              COALESCE(m.reactions, '{}'::jsonb) AS reactions,
+              reply.message AS reply_message,
+              reply.message_type AS reply_message_type,
+              reply_sender.email AS reply_sender_email,
+              COALESCE(reply_student.full_name, reply_teacher.full_name, reply_parent.full_name, reply_admin.full_name, reply_sender.username, reply_sender.email) AS reply_sender_name
        FROM messages m
        JOIN users sender_user ON sender_user.id = m.sender_id
+       LEFT JOIN messages reply ON reply.id = m.reply_to_message_id
+       LEFT JOIN users reply_sender ON reply_sender.id = reply.sender_id
+       LEFT JOIN students reply_student ON reply_student.user_id = reply_sender.id
+       LEFT JOIN teachers reply_teacher ON reply_teacher.user_id = reply_sender.id
+       LEFT JOIN parents reply_parent ON reply_parent.user_id = reply_sender.id
+       LEFT JOIN admins reply_admin ON reply_admin.user_id = reply_sender.id
        WHERE m.group_id IS NULL
          AND (
            (m.sender_id = $1 AND m.receiver_id = $2)
@@ -3504,8 +3589,11 @@ app.post("/chat/thread/send", async (req, res) => {
   const thumbnailUrl = req.body.thumbnailUrl || null;
   const durationSeconds = req.body.durationSeconds || null;
   const clientMessageId = req.body.clientMessageId || null;
+  const replyToMessageId = req.body.replyToMessageId || null;
+  const forwardedFromMessageId = req.body.forwardedFromMessageId || null;
 
   try {
+    await ensureChatMessageFeatureSchema();
     const sender = await getUserByEmail(senderEmail);
     const receiver = await getUserByEmail(receiverEmail);
     if (!sender || !receiver) {
@@ -3537,12 +3625,15 @@ app.post("/chat/thread/send", async (req, res) => {
          media_url,
          thumbnail_url,
          duration_seconds,
-         client_message_id
+         client_message_id,
+         reply_to_message_id,
+         forwarded_from_message_id
        )
-       VALUES ($1, $2, $3, false, $4, $5, $6, $7, $8, $9)
+       VALUES ($1, $2, $3, false, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id, sender_id, receiver_id, message, sender_role, created_at, is_read,
                  delivered_at, read_at, message_type, media_url, thumbnail_url,
-                 duration_seconds, client_message_id`,
+                 duration_seconds, client_message_id, reply_to_message_id,
+                 forwarded_from_message_id, is_pinned, pinned_at, reactions`,
       [
         sender.id,
         receiver.id,
@@ -3553,6 +3644,8 @@ app.post("/chat/thread/send", async (req, res) => {
         thumbnailUrl,
         durationSeconds,
         clientMessageId,
+        replyToMessageId,
+        forwardedFromMessageId,
       ]
     );
 
@@ -3599,6 +3692,142 @@ app.post("/chat/thread/read", async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error("Read Chat Thread Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/chat/contact-profile/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const profile = await getChatContactProfile(email);
+    if (!profile) {
+      return res.status(404).json({ error: "Contact not found" });
+    }
+
+    res.json(profile);
+  } catch (e) {
+    console.error("Chat Contact Profile Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/messages/:messageId/react", async (req, res) => {
+  const messageId = req.params.messageId;
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const emoji = String(req.body.emoji || "").trim();
+
+  if (!emoji) {
+    return res.status(400).json({ error: "Emoji reaction is required" });
+  }
+
+  try {
+    await ensureChatMessageFeatureSchema();
+    const actor = await getUserByEmail(actorEmail);
+    if (!actor) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const messageResult = await pool.query(
+      `SELECT id, sender_id, receiver_id, group_id, reactions
+       FROM messages
+       WHERE id = $1
+       LIMIT 1`,
+      [messageId]
+    );
+
+    if (messageResult.rows.length === 0) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+
+    const message = messageResult.rows[0];
+    if (message.group_id) {
+      const membership = await getGroupMembership(message.group_id, actor.id);
+      if (!membership) {
+        return res.status(403).json({ error: "You are not a member of this group" });
+      }
+    } else {
+      const allowed = actor.id === message.sender_id || actor.id === message.receiver_id;
+      if (!allowed) {
+        return res.status(403).json({ error: "You cannot react to this message" });
+      }
+    }
+
+    const reactions = normalizeReactionState(message.reactions);
+    const currentUsers = Array.isArray(reactions[emoji]) ? reactions[emoji] : [];
+    const actorKey = normalizeEmail(actor.email);
+    if (currentUsers.includes(actorKey)) {
+      reactions[emoji] = currentUsers.filter((value) => value !== actorKey);
+      if (reactions[emoji].length === 0) {
+        delete reactions[emoji];
+      }
+    } else {
+      reactions[emoji] = [...currentUsers, actorKey];
+    }
+
+    const updated = await pool.query(
+      `UPDATE messages
+       SET reactions = $2::jsonb
+       WHERE id = $1
+       RETURNING id, reactions`,
+      [messageId, JSON.stringify(reactions)]
+    );
+
+    res.json(updated.rows[0]);
+  } catch (e) {
+    console.error("React Message Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/messages/:messageId/pin", async (req, res) => {
+  const messageId = req.params.messageId;
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const shouldPin = req.body.isPinned === true;
+
+  try {
+    await ensureChatMessageFeatureSchema();
+    const actor = await getUserByEmail(actorEmail);
+    if (!actor) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const messageResult = await pool.query(
+      `SELECT id, sender_id, receiver_id, group_id
+       FROM messages
+       WHERE id = $1
+       LIMIT 1`,
+      [messageId]
+    );
+
+    if (messageResult.rows.length === 0) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+
+    const message = messageResult.rows[0];
+    if (message.group_id) {
+      const membership = await getGroupMembership(message.group_id, actor.id);
+      if (!membership) {
+        return res.status(403).json({ error: "You are not a member of this group" });
+      }
+    } else {
+      const allowed = actor.id === message.sender_id || actor.id === message.receiver_id;
+      if (!allowed) {
+        return res.status(403).json({ error: "You cannot pin this message" });
+      }
+    }
+
+    const updated = await pool.query(
+      `UPDATE messages
+       SET is_pinned = $2,
+           pinned_at = CASE WHEN $2 THEN NOW() ELSE NULL END
+       WHERE id = $1
+       RETURNING id, is_pinned, pinned_at`,
+      [messageId, shouldPin]
+    );
+
+    res.json(updated.rows[0]);
+  } catch (e) {
+    console.error("Pin Message Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -3754,6 +3983,7 @@ app.get("/chat/groups/:groupId/messages/:email", async (req, res) => {
   const groupId = req.params.groupId;
   const email = normalizeEmail(req.params.email);
   try {
+    await ensureChatMessageFeatureSchema();
     const user = await getUserByEmail(email);
     if (!user) {
       return res.status(404).json({ error: "User not found" });
@@ -3788,13 +4018,28 @@ app.get("/chat/groups/:groupId/messages/:email", async (req, res) => {
               m.thumbnail_url,
               m.duration_seconds,
               m.client_message_id,
-              COALESCE(s.full_name, t.full_name, p.full_name, a.full_name, u.username, u.email) AS sender_name
+              m.reply_to_message_id,
+              m.forwarded_from_message_id,
+              COALESCE(m.is_pinned, false) AS is_pinned,
+              m.pinned_at,
+              COALESCE(m.reactions, '{}'::jsonb) AS reactions,
+              COALESCE(s.full_name, t.full_name, p.full_name, a.full_name, u.username, u.email) AS sender_name,
+              reply.message AS reply_message,
+              reply.message_type AS reply_message_type,
+              reply_sender.email AS reply_sender_email,
+              COALESCE(rs.full_name, rt.full_name, rp.full_name, ra.full_name, reply_sender.username, reply_sender.email) AS reply_sender_name
        FROM messages m
        JOIN users u ON u.id = m.sender_id
        LEFT JOIN students s ON s.user_id = u.id
        LEFT JOIN teachers t ON t.user_id = u.id
        LEFT JOIN parents p ON p.user_id = u.id
        LEFT JOIN admins a ON a.user_id = u.id
+       LEFT JOIN messages reply ON reply.id = m.reply_to_message_id
+       LEFT JOIN users reply_sender ON reply_sender.id = reply.sender_id
+       LEFT JOIN students rs ON rs.user_id = reply_sender.id
+       LEFT JOIN teachers rt ON rt.user_id = reply_sender.id
+       LEFT JOIN parents rp ON rp.user_id = reply_sender.id
+       LEFT JOIN admins ra ON ra.user_id = reply_sender.id
        WHERE m.group_id = $1
        ORDER BY m.created_at ASC`,
       [groupId]
@@ -3816,8 +4061,11 @@ app.post("/chat/groups/:groupId/messages", async (req, res) => {
   const thumbnailUrl = req.body.thumbnailUrl || null;
   const durationSeconds = req.body.durationSeconds || null;
   const clientMessageId = req.body.clientMessageId || null;
+  const replyToMessageId = req.body.replyToMessageId || null;
+  const forwardedFromMessageId = req.body.forwardedFromMessageId || null;
 
   try {
+    await ensureChatMessageFeatureSchema();
     const sender = await getUserByEmail(senderEmail);
     if (!sender) {
       return res.status(404).json({ error: "Sender not found" });
@@ -3866,9 +4114,11 @@ app.post("/chat/groups/:groupId/messages", async (req, res) => {
          media_url,
          thumbnail_url,
          duration_seconds,
-         client_message_id
+         client_message_id,
+         reply_to_message_id,
+         forwarded_from_message_id
        )
-       VALUES ($1, NULL, $2, $3, false, $4, $5, $6, $7, $8, $9)
+       VALUES ($1, NULL, $2, $3, false, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
       [
         sender.id,
@@ -3880,6 +4130,8 @@ app.post("/chat/groups/:groupId/messages", async (req, res) => {
         thumbnailUrl,
         durationSeconds,
         clientMessageId,
+        replyToMessageId,
+        forwardedFromMessageId,
       ]
     );
 
