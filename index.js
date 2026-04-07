@@ -97,6 +97,39 @@ async function ensureAdminUser(email) {
 }
 
 const CHAT_APPEAL_WINDOW_HOURS = Number(process.env.CHAT_APPEAL_WINDOW_HOURS || 48);
+const CHAT_TYPING_TTL_MS = Number(process.env.CHAT_TYPING_TTL_MS || 8000);
+const chatTypingState = new Map();
+
+function buildTypingKey(senderId, receiverId) {
+  return `${senderId}:${receiverId}`;
+}
+
+function setTypingState(senderId, receiverId, isTyping) {
+  const key = buildTypingKey(senderId, receiverId);
+  if (!isTyping) {
+    chatTypingState.delete(key);
+    return;
+  }
+
+  chatTypingState.set(key, {
+    updatedAt: Date.now(),
+  });
+}
+
+function readTypingState(senderId, receiverId) {
+  const key = buildTypingKey(senderId, receiverId);
+  const entry = chatTypingState.get(key);
+  if (!entry) {
+    return null;
+  }
+
+  if (Date.now() - entry.updatedAt > CHAT_TYPING_TTL_MS) {
+    chatTypingState.delete(key);
+    return null;
+  }
+
+  return entry;
+}
 
 function buildChatFreezeMessage(reason) {
   return reason || "Chat access has been frozen. Please contact the school admin.";
@@ -308,6 +341,36 @@ async function ensureChatGroupRoleSchema(client = pool) {
      SET role = CASE WHEN is_admin = true THEN 'admin' ELSE 'member' END
      WHERE role IS NULL OR role = ''`
   );
+}
+
+async function getNextStudentAdmissionNumber(client = pool) {
+  await client.query(`SELECT pg_advisory_xact_lock(11000)`);
+  await client.query(
+    `CREATE SEQUENCE IF NOT EXISTS public.student_admission_number_seq
+     START WITH 11000
+     INCREMENT BY 1
+     MINVALUE 11000`
+  );
+  await client.query(
+    `SELECT setval(
+       'public.student_admission_number_seq',
+       GREATEST(
+         COALESCE(
+           (SELECT MAX(admission_number::bigint)
+            FROM students
+            WHERE admission_number ~ '^[0-9]+$'),
+           10999
+         ),
+         10999
+       ),
+       true
+     )`
+  );
+
+  const nextResult = await client.query(
+    `SELECT nextval('public.student_admission_number_seq') AS next_value`
+  );
+  return String(nextResult.rows[0].next_value);
 }
 
 function normalizeOtpChannel(channel) {
@@ -918,15 +981,27 @@ app.post("/approve-registration/:id", async (req, res) => {
     }
 
     if (role === 'student') {
+      const existingStudent = await client.query(
+        `SELECT admission_number
+         FROM students
+         WHERE user_id = $1
+         LIMIT 1`,
+        [userId]
+      );
+      const admissionNumber =
+        existingStudent.rows[0]?.admission_number ||
+        await getNextStudentAdmissionNumber(client);
+
       await client.query(
-        `INSERT INTO students (user_id, full_name, phone)
-         VALUES ($1, $2, $3)
+        `INSERT INTO students (user_id, admission_number, full_name, phone)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id)
          DO UPDATE SET
+           admission_number = EXCLUDED.admission_number,
            full_name = EXCLUDED.full_name,
            phone = EXCLUDED.phone,
            updated_at = NOW()`,
-        [userId, fullName, phone]
+        [userId, admissionNumber, fullName, phone]
       );
     }
 
@@ -1430,10 +1505,6 @@ app.put("/student-profile/:email", async (req, res) => {
   }
 
   try {
-    const normalizedPicture =
-      typeof profile_picture_url === "string" && profile_picture_url.trim().length > 0
-        ? profile_picture_url.trim()
-        : null;
     const adminOverrideKey = process.env.ADMIN_PROFILE_OVERRIDE_KEY;
     const hasAdminOverride =
       adminOverrideKey &&
@@ -1454,7 +1525,7 @@ app.put("/student-profile/:email", async (req, res) => {
     }
 
     const existingProfile = await pool.query(
-      "SELECT id, profile_locked, full_name, admission_number FROM students WHERE user_id = $1 LIMIT 1",
+      "SELECT id, profile_locked, full_name, admission_number, profile_picture_url FROM students WHERE user_id = $1 LIMIT 1",
       [user.id]
     );
 
@@ -1476,6 +1547,12 @@ app.put("/student-profile/:email", async (req, res) => {
       existingProfile.rows.length > 0
         ? existingProfile.rows[0].admission_number
         : String(admission_number).trim();
+    const preservedPicture =
+      typeof profile_picture_url === "string" && profile_picture_url.trim().length > 0
+        ? profile_picture_url.trim()
+        : (existingProfile.rows.length > 0
+            ? existingProfile.rows[0].profile_picture_url || null
+            : null);
 
     const upsertResult = await pool.query(
       `INSERT INTO students (
@@ -1514,7 +1591,7 @@ app.put("/student-profile/:email", async (req, res) => {
         String(class_name).trim(),
         phone ? String(phone).trim() : null,
         address ? String(address).trim() : null,
-        normalizedPicture,
+        preservedPicture,
       ]
     );
 
@@ -2650,6 +2727,81 @@ app.post("/chat/appeals", async (req, res) => {
   }
 });
 
+app.post("/calls/initiate", async (req, res) => {
+  const callerEmail = normalizeEmail(req.body.callerId);
+  const recipientEmail = normalizeEmail(req.body.recipientId);
+  const groupId = req.body.groupId || null;
+  const callType = String(req.body.callType || "voice").trim().toLowerCase();
+
+  if (!callerEmail || (!recipientEmail && !groupId)) {
+    return res.status(400).json({ error: "Caller and recipient or group are required" });
+  }
+
+  try {
+    const caller = await getUserByEmail(callerEmail);
+    if (!caller) {
+      return res.status(404).json({ error: "Caller was not found" });
+    }
+
+    if (groupId) {
+      const membersResult = await pool.query(
+        `SELECT DISTINCT cgm.user_id
+         FROM chat_group_members cgm
+         WHERE cgm.group_id = $1
+           AND cgm.user_id <> $2`,
+        [groupId, caller.id]
+      );
+
+      for (const member of membersResult.rows) {
+        await pool.query(
+          `INSERT INTO notifications (user_id, title, message, type, is_read)
+           VALUES ($1, $2, $3, 'call_request', false)`,
+          [
+            member.user_id,
+            callType === 'video' ? 'Incoming group video call' : 'Incoming group voice call',
+            `${caller.username || caller.email} started a ${callType} call in your group.`,
+          ]
+        );
+      }
+
+      return res.status(201).json({
+        ok: true,
+        call_type: callType,
+        group_id: groupId,
+      });
+    }
+
+    const recipient = await getUserByEmail(recipientEmail);
+    if (!recipient) {
+      return res.status(404).json({ error: "Recipient was not found" });
+    }
+
+    const canChat = await ensureAcceptedFriendshipOrFamily(caller.id, recipient.id);
+    if (!canChat) {
+      return res.status(403).json({ error: "You must be allowed to chat before calling" });
+    }
+
+    await pool.query(
+      `INSERT INTO notifications (user_id, title, message, type, is_read)
+       VALUES ($1, $2, $3, 'call_request', false)`,
+      [
+        recipient.id,
+        callType === 'video' ? 'Incoming video call' : 'Incoming voice call',
+        `${caller.username || caller.email} is calling you.`,
+      ]
+    );
+
+    return res.status(201).json({
+      ok: true,
+      call_type: callType,
+      recipient_id: recipient.id,
+    });
+  } catch (e) {
+    console.error("Call Initiation Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/announcements", async (req, res) => {
   try {
     const result = await pool.query(`
@@ -2859,6 +3011,58 @@ app.post("/chat/presence/offline", async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error("Chat Presence Offline Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/thread/typing", async (req, res) => {
+  const senderEmail = normalizeEmail(req.body.senderEmail);
+  const receiverEmail = normalizeEmail(req.body.receiverEmail);
+  const isTyping = req.body.isTyping === true;
+
+  try {
+    const sender = await getUserByEmail(senderEmail);
+    const receiver = await getUserByEmail(receiverEmail);
+    if (!sender || !receiver) {
+      return res.status(404).json({ error: "Sender or receiver was not found" });
+    }
+
+    const canChat = await ensureAcceptedFriendshipOrFamily(sender.id, receiver.id);
+    if (!canChat) {
+      return res.status(403).json({ error: "You must be allowed to chat first" });
+    }
+
+    setTypingState(sender.id, receiver.id, isTyping);
+    res.json({ ok: true, is_typing: isTyping, updated_at: new Date().toISOString() });
+  } catch (e) {
+    console.error("Chat Typing Update Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/chat/thread/typing/:email/:peerEmail", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  const peerEmail = normalizeEmail(req.params.peerEmail);
+
+  try {
+    const user = await getUserByEmail(email);
+    const peer = await getUserByEmail(peerEmail);
+    if (!user || !peer) {
+      return res.status(404).json({ error: "User was not found" });
+    }
+
+    const canChat = await ensureAcceptedFriendshipOrFamily(user.id, peer.id);
+    if (!canChat) {
+      return res.status(403).json({ error: "You must be allowed to chat first" });
+    }
+
+    const entry = readTypingState(peer.id, user.id);
+    res.json({
+      is_typing: !!entry,
+      updated_at: entry ? new Date(entry.updatedAt).toISOString() : null,
+    });
+  } catch (e) {
+    console.error("Chat Typing Status Error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -3334,6 +3538,8 @@ app.post("/chat/thread/send", async (req, res) => {
         clientMessageId,
       ]
     );
+
+    setTypingState(sender.id, receiver.id, false);
 
     res.status(201).json(result.rows[0]);
   } catch (e) {
@@ -4067,6 +4273,8 @@ app.get("/teacher-profile/:email", async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT t.full_name, t.subject, t.phone, t.profile_picture_url,
+             t.class_name, t.teacher_number, t.profile_locked,
+             u.email,
              COUNT(DISTINCT c.id) as total_classes,
              (SELECT COUNT(DISTINCT s.id) 
               FROM students s 
@@ -4085,6 +4293,134 @@ app.get("/teacher-profile/:email", async (req, res) => {
     res.json(result.rows[0]);
   } catch (e) {
     console.error("Teacher Profile Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put("/teacher-profile/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  const {
+    full_name,
+    subject,
+    class_name,
+    phone,
+    teacher_number,
+    profile_picture_url,
+  } = req.body;
+
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: "A valid email address is required" });
+  }
+
+  if (!full_name || !teacher_number) {
+    return res.status(400).json({
+      error: "Full name and teacher number are required",
+    });
+  }
+
+  try {
+    const adminOverrideKey = process.env.ADMIN_PROFILE_OVERRIDE_KEY;
+    const hasAdminOverride =
+      adminOverrideKey &&
+      req.get("x-admin-profile-override") === adminOverrideKey;
+
+    const userResult = await pool.query(
+      "SELECT id, role FROM users WHERE email = $1 LIMIT 1",
+      [email]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const user = userResult.rows[0];
+    if (user.role !== 'teacher') {
+      return res.status(403).json({ error: "Only teacher accounts can update this profile" });
+    }
+
+    const existingProfile = await pool.query(
+      "SELECT id, profile_locked, teacher_number, profile_picture_url FROM teachers WHERE user_id = $1 LIMIT 1",
+      [user.id]
+    );
+
+    if (
+      existingProfile.rows.length > 0 &&
+      existingProfile.rows[0].profile_locked === true &&
+      !hasAdminOverride
+    ) {
+      return res.status(403).json({
+        error: "This teacher profile is locked. Ask an admin to unlock it.",
+      });
+    }
+
+    const preservedPicture =
+      typeof profile_picture_url === "string" && profile_picture_url.trim().length > 0
+        ? profile_picture_url.trim()
+        : (existingProfile.rows.length > 0
+            ? existingProfile.rows[0].profile_picture_url || null
+            : null);
+    const preservedTeacherNumber =
+      existingProfile.rows.length > 0 && existingProfile.rows[0].teacher_number
+        ? existingProfile.rows[0].teacher_number
+        : String(teacher_number).trim();
+
+    await pool.query(
+      `INSERT INTO teachers (
+         user_id,
+         teacher_number,
+         full_name,
+         subject,
+         phone,
+         profile_picture_url,
+         class_name,
+         profile_locked,
+         updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, true, NOW())
+       ON CONFLICT (user_id)
+       DO UPDATE SET
+         teacher_number = EXCLUDED.teacher_number,
+         full_name = EXCLUDED.full_name,
+         subject = EXCLUDED.subject,
+         phone = EXCLUDED.phone,
+         profile_picture_url = EXCLUDED.profile_picture_url,
+         class_name = EXCLUDED.class_name,
+         profile_locked = true,
+         updated_at = NOW()`,
+      [
+        user.id,
+        preservedTeacherNumber,
+        String(full_name).trim(),
+        subject ? String(subject).trim() : null,
+        phone ? String(phone).trim() : null,
+        preservedPicture,
+        class_name ? String(class_name).trim() : null,
+      ]
+    );
+
+    const profileResult = await pool.query(`
+      SELECT t.full_name, t.subject, t.phone, t.profile_picture_url,
+             t.class_name, t.teacher_number, t.profile_locked,
+             u.email,
+             COUNT(DISTINCT c.id) as total_classes,
+             (SELECT COUNT(DISTINCT s.id)
+              FROM students s
+              WHERE s.class_name = t.class_name) as total_students
+      FROM teachers t
+      JOIN users u ON t.user_id = u.id
+      LEFT JOIN classes c ON c.teacher_id = t.id
+      WHERE u.email = $1
+      GROUP BY t.id, u.email
+      LIMIT 1`,
+      [email]
+    );
+
+    res.status(200).json(profileResult.rows[0]);
+  } catch (e) {
+    console.error("Update Teacher Profile Error:", e);
+    if (e.code === '23505') {
+      return res.status(400).json({ error: "Teacher number is already in use" });
+    }
     res.status(500).json({ error: e.message });
   }
 });

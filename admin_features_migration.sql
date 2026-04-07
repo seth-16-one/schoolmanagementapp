@@ -46,6 +46,21 @@ ADD COLUMN IF NOT EXISTS chat_freeze_expires_at timestamp without time zone;
 ALTER TABLE public.teachers
 ADD COLUMN IF NOT EXISTS profile_locked boolean DEFAULT true;
 
+ALTER TABLE public.students
+ADD COLUMN IF NOT EXISTS profile_locked boolean DEFAULT false,
+ADD COLUMN IF NOT EXISTS profile_picture_url text;
+
+ALTER TABLE public.teachers
+ADD COLUMN IF NOT EXISTS profile_picture_url text;
+
+UPDATE public.students
+SET profile_locked = COALESCE(profile_locked, false)
+WHERE profile_locked IS NULL;
+
+UPDATE public.teachers
+SET profile_locked = COALESCE(profile_locked, true)
+WHERE profile_locked IS NULL;
+
 CREATE INDEX IF NOT EXISTS messages_moderation_idx
 ON public.messages (moderation_status, flagged_at DESC);
 

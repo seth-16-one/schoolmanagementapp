@@ -63,3 +63,29 @@ ON public.friend_requests (sender_id, receiver_id);
 
 CREATE UNIQUE INDEX IF NOT EXISTS parent_child_parent_student_uidx
 ON public.parent_child (parent_id, student_id);
+
+CREATE SEQUENCE IF NOT EXISTS public.student_admission_number_seq
+START WITH 11000
+INCREMENT BY 1
+MINVALUE 11000;
+
+SELECT setval(
+  'public.student_admission_number_seq',
+  GREATEST(
+    COALESCE(
+      (SELECT MAX(admission_number::bigint)
+       FROM public.students
+       WHERE admission_number ~ '^[0-9]+$'),
+      10999
+    ),
+    10999
+  ),
+  true
+);
+
+ALTER TABLE public.students
+ALTER COLUMN admission_number SET DEFAULT nextval('public.student_admission_number_seq')::text;
+
+UPDATE public.students
+SET admission_number = nextval('public.student_admission_number_seq')::text
+WHERE admission_number IS NULL OR btrim(admission_number) = '';
