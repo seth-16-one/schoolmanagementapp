@@ -70,6 +70,59 @@ async function getUserByEmail(email) {
   return result.rows[0] || null;
 }
 
+function getRequestIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  return (
+    req.headers["x-real-ip"] ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    null
+  );
+}
+
+async function recordLoginSession(req, user) {
+  try {
+    if (!user?.id) return null;
+    const ipAddress = getRequestIp(req);
+    const deviceInfo = String(req.headers["user-agent"] || "").trim() || null;
+    await pool.query(
+      `UPDATE login_sessions
+       SET is_current = false
+       WHERE user_id = $1
+         AND logged_out_at IS NULL`,
+      [user.id]
+    );
+    const existing = await pool.query(
+      `SELECT id, ip_address, device_info
+       FROM login_sessions
+       WHERE user_id = $1
+       ORDER BY logged_in_at DESC
+       LIMIT 1`,
+      [user.id]
+    );
+    const previous = existing.rows[0];
+    const suspicious =
+      !!previous &&
+      ((previous.ip_address || "") !== (ipAddress || "") ||
+        (previous.device_info || "") !== (deviceInfo || ""));
+
+    const result = await pool.query(
+      `INSERT INTO login_sessions (user_id, role, ip_address, device_info, suspicious, is_current)
+       VALUES ($1, $2, $3, $4, $5, true)
+       RETURNING id, logged_in_at, ip_address, device_info, suspicious, is_current`,
+      [user.id, user.role, ipAddress, deviceInfo, suspicious]
+    );
+
+    return result.rows[0] || null;
+  } catch (e) {
+    console.error("Record Login Session Error:", e);
+    return null;
+  }
+}
+
 async function getStudentRecordByEmail(email) {
   const normalizedEmail = normalizeEmail(email);
   const result = await pool.query(
@@ -766,6 +819,9 @@ app.post("/student-login", async (req, res) => {
 
   try {
     const result = await loginUserFromUsersTable(usernameOrEmail, password, "student");
+    if (result.status === 200 && result.body?.user) {
+      result.body.session = await recordLoginSession(req, result.body.user);
+    }
     return res.status(result.status).json(result.body);
   } catch (e) {
     console.error("Student Login Error:", e);
@@ -781,6 +837,9 @@ app.post("/teacher-login", async (req, res) => {
 
   try {
     const result = await loginUserFromUsersTable(usernameOrEmail, password, "teacher");
+    if (result.status === 200 && result.body?.user) {
+      result.body.session = await recordLoginSession(req, result.body.user);
+    }
     return res.status(result.status).json(result.body);
   } catch (e) {
     console.error("Teacher Login Error:", e);
@@ -796,6 +855,9 @@ app.post("/parent-login", async (req, res) => {
 
   try {
     const result = await loginUserFromUsersTable(usernameOrEmail, password, "parent");
+    if (result.status === 200 && result.body?.user) {
+      result.body.session = await recordLoginSession(req, result.body.user);
+    }
     return res.status(result.status).json(result.body);
   } catch (e) {
     console.error("Parent Login Error:", e);
@@ -811,6 +873,9 @@ app.post("/finance-login", async (req, res) => {
 
   try {
     const result = await loginUserFromUsersTable(usernameOrEmail, password, "finance");
+    if (result.status === 200 && result.body?.user) {
+      result.body.session = await recordLoginSession(req, result.body.user);
+    }
     return res.status(result.status).json(result.body);
   } catch (e) {
     console.error("Finance Login Error:", e);
@@ -934,7 +999,8 @@ app.post("/login-otp/verify", async (req, res) => {
   }
 
   otpChallenges.delete(challengeId);
-  return res.status(200).json({ user: challenge.user });
+  const session = await recordLoginSession(req, challenge.user);
+  return res.status(200).json({ user: challenge.user, session });
 });
 
 // Admin Login
@@ -946,6 +1012,9 @@ app.post("/admin-login", async (req, res) => {
 
   try {
     const result = await authenticateAdminLogin(usernameOrEmail, password);
+    if (result.status === 200 && result.body?.user) {
+      result.body.session = await recordLoginSession(req, result.body.user);
+    }
     res.status(result.status).json(result.body);
   } catch (e) {
     console.error("Admin Login Error:", e);
@@ -2204,6 +2273,64 @@ app.put("/notifications/:email/read-all", async (req, res) => {
   } catch (e) {
     console.error("Mark All Notifications Read Error:", e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/login-sessions/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT id,
+              role,
+              ip_address,
+              device_info,
+              suspicious,
+              logged_in_at,
+              logged_out_at,
+              is_current
+       FROM login_sessions
+       WHERE user_id = $1
+       ORDER BY logged_in_at DESC
+       LIMIT 20`,
+      [user.id]
+    );
+
+    return res.json({ sessions: result.rows });
+  } catch (e) {
+    console.error("Get Login Sessions Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/login-sessions/logout-others", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const currentSessionId = String(req.body.currentSessionId || "").trim();
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `UPDATE login_sessions
+       SET logged_out_at = NOW(),
+           is_current = false
+       WHERE user_id = $1
+         AND ($2 = '' OR id::text <> $2)
+         AND logged_out_at IS NULL
+       RETURNING id`,
+      [user.id, currentSessionId]
+    );
+
+    return res.json({ success: true, count: result.rows.length });
+  } catch (e) {
+    console.error("Logout Other Devices Error:", e);
+    return res.status(500).json({ error: e.message });
   }
 });
 
