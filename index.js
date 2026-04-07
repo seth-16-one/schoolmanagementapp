@@ -34,6 +34,7 @@ app.get("/health", (req, res) => {
 // ===================== AUTH =====================
 
 const otpChallenges = new Map();
+const passwordResetChallenges = new Map();
 const OTP_EXPIRY_MS = Number(process.env.OTP_EXPIRY_MS || 10 * 60 * 1000);
 const OTP_MAX_ATTEMPTS = Number(process.env.OTP_MAX_ATTEMPTS || 5);
 const OTP_DEV_PREVIEW = process.env.OTP_DEV_PREVIEW !== "false";
@@ -519,6 +520,15 @@ function cleanupExpiredOtpChallenges() {
   for (const [challengeId, challenge] of otpChallenges.entries()) {
     if (challenge.expiresAt <= now) {
       otpChallenges.delete(challengeId);
+    }
+  }
+}
+
+function cleanupExpiredPasswordResetChallenges() {
+  const now = Date.now();
+  for (const [challengeId, challenge] of passwordResetChallenges.entries()) {
+    if (challenge.expiresAt <= now) {
+      passwordResetChallenges.delete(challengeId);
     }
   }
 }
@@ -1014,6 +1024,157 @@ app.post("/login-otp/verify", async (req, res) => {
   otpChallenges.delete(challengeId);
   const session = await recordLoginSession(req, challenge.user);
   return res.status(200).json({ user: challenge.user, session });
+});
+
+app.post("/password-reset/request", async (req, res) => {
+  const {
+    usernameOrEmail,
+    expectedRole,
+    channel,
+  } = req.body;
+
+  if (!usernameOrEmail) {
+    return res.status(400).json({ error: "Username or email is required" });
+  }
+
+  cleanupExpiredPasswordResetChallenges();
+
+  try {
+    const lookup = String(usernameOrEmail).trim();
+    const result = await pool.query(
+      `SELECT id, username, email, role
+       FROM users
+       WHERE username = $1 OR email = $1
+       LIMIT 1`,
+      [lookup]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Account not found" });
+    }
+
+    const user = result.rows[0];
+    const normalizedExpectedRole = expectedRole
+      ? String(expectedRole).toLowerCase().trim()
+      : null;
+    if (normalizedExpectedRole && user.role !== normalizedExpectedRole) {
+      return res.status(403).json({
+        error: `This app accepts ${normalizedExpectedRole} accounts only`,
+      });
+    }
+
+    const requestedChannel = normalizeOtpChannel(channel);
+    const destinations = await resolveOtpDestinations(user);
+    const availableChannels = Object.keys(destinations);
+
+    if (!availableChannels.length) {
+      return res.status(400).json({
+        error: "No password reset delivery destination is configured for this account",
+      });
+    }
+
+    if (!destinations[requestedChannel]) {
+      return res.status(400).json({
+        error: `${requestedChannel.toUpperCase()} password reset code is not available for this account`,
+        availableChannels,
+        maskedDestinations: {
+          email: maskValue(destinations.email, "email"),
+          sms: maskValue(destinations.sms, "phone"),
+        }
+      });
+    }
+
+    const challengeId = uuidv4();
+    const code = generateOtpCode();
+    const expiresAt = Date.now() + OTP_EXPIRY_MS;
+    const destination = destinations[requestedChannel];
+    const delivery = await deliverOtp({
+      user,
+      channel: requestedChannel,
+      destination,
+      code,
+    });
+
+    passwordResetChallenges.set(challengeId, {
+      attempts: 0,
+      code,
+      user,
+      channel: requestedChannel,
+      expiresAt,
+    });
+
+    return res.status(200).json({
+      challengeId,
+      channel: requestedChannel,
+      destinationMasked: maskValue(
+        destination,
+        requestedChannel === "sms" ? "phone" : "email"
+      ),
+      availableChannels,
+      maskedDestinations: {
+        email: maskValue(destinations.email, "email"),
+        sms: maskValue(destinations.sms, "phone"),
+      },
+      expiresAt: new Date(expiresAt).toISOString(),
+      deliveryMode: delivery.deliveryMode,
+      previewCode: delivery.previewCode,
+    });
+  } catch (e) {
+    console.error("Password Reset Request Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/password-reset/confirm", async (req, res) => {
+  const { challengeId, code, newPassword } = req.body;
+
+  if (!challengeId || !code || !newPassword) {
+    return res.status(400).json({ error: "Challenge ID, code, and new password are required" });
+  }
+
+  if (String(newPassword).trim().length < 6) {
+    return res.status(400).json({ error: "New password must be at least 6 characters long" });
+  }
+
+  cleanupExpiredPasswordResetChallenges();
+  const challenge = passwordResetChallenges.get(challengeId);
+
+  if (!challenge) {
+    return res.status(404).json({ error: "Password reset challenge expired or was not found" });
+  }
+
+  if (challenge.expiresAt <= Date.now()) {
+    passwordResetChallenges.delete(challengeId);
+    return res.status(410).json({ error: "Password reset code has expired" });
+  }
+
+  challenge.attempts += 1;
+  if (String(code).trim() !== challenge.code) {
+    if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
+      passwordResetChallenges.delete(challengeId);
+      return res.status(429).json({ error: "Too many incorrect verification attempts" });
+    }
+
+    return res.status(401).json({
+      error: "Invalid verification code",
+      remainingAttempts: OTP_MAX_ATTEMPTS - challenge.attempts,
+    });
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(String(newPassword).trim(), 10);
+    await pool.query(
+      `UPDATE users
+       SET password_hash = $2
+       WHERE id = $1`,
+      [challenge.user.id, passwordHash]
+    );
+    passwordResetChallenges.delete(challengeId);
+    return res.status(200).json({ success: true });
+  } catch (e) {
+    console.error("Password Reset Confirm Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 // Admin Login
