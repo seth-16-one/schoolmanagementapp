@@ -1,6 +1,7 @@
 // ---------------- IMPORTS ----------------
 require('dotenv').config();
 const express = require("express");
+const path = require("path");
 const cors = require("cors");
 const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
@@ -14,6 +15,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use("/downloads", express.static(path.join(__dirname, "public")));
 
 // ---------------- DATABASE CONNECTION ----------------
 const pool = new Pool({
@@ -32,6 +34,20 @@ app.get("/health", (req, res) => {
     ok: true,
     service: "school_backend",
     timestamp: new Date().toISOString(),
+  });
+});
+app.get("/version", (req, res) => {
+  const configuredBaseUrl = String(
+    process.env.PUBLIC_BASE_URL || process.env.APP_BASE_URL || ""
+  ).trim().replace(/\/+$/, "");
+  const inferredBaseUrl = `${req.protocol}://${req.get("host")}`;
+  const baseUrl = configuredBaseUrl || inferredBaseUrl;
+
+  res.status(200).json({
+    app_name: "eSchool Student",
+    version: "1.1.3",
+    apk_url: `${baseUrl}/downloads/eschool_student.apk`,
+    notes: "Bug fixes and improvements",
   });
 });
 
@@ -3233,7 +3249,7 @@ app.get("/live-classes/:studentEmail", async (req, res) => {
       JOIN students s
         ON lc.class_name IS NULL
         OR lc.class_name = ''
-        OR s.class_name = lc.class_name
+        OR LOWER(TRIM(COALESCE(s.class_name, ''))) = LOWER(TRIM(COALESCE(lc.class_name, '')))
       JOIN users u ON s.user_id = u.id
       WHERE u.email = $1
       ORDER BY lc.class_time DESC`,
@@ -6189,7 +6205,7 @@ app.post("/live-classes/create", async (req, res) => {
 
     const user = hostUser.rows[0];
     let teacherId = null;
-    let resolvedClassName = className || null;
+    let resolvedClassName = typeof className === "string" ? className.trim() : null;
 
     if (user.role === 'teacher') {
       const teacher = await pool.query(
@@ -6200,7 +6216,8 @@ app.post("/live-classes/create", async (req, res) => {
         return res.status(403).json({ error: "Teacher profile not found" });
       }
       teacherId = teacher.rows[0].id;
-      resolvedClassName = resolvedClassName || teacher.rows[0].class_name || null;
+      resolvedClassName =
+        resolvedClassName || String(teacher.rows[0].class_name || "").trim() || null;
     } else if (user.role === 'student') {
       const student = await pool.query(
         "SELECT class_name FROM students WHERE user_id = $1 LIMIT 1",
@@ -6209,7 +6226,8 @@ app.post("/live-classes/create", async (req, res) => {
       if (student.rows.length === 0) {
         return res.status(403).json({ error: "Student profile not found" });
       }
-      resolvedClassName = resolvedClassName || student.rows[0].class_name || null;
+      resolvedClassName =
+        resolvedClassName || String(student.rows[0].class_name || "").trim() || null;
     } else {
       return res.status(403).json({ error: "Only teachers and students can create live classes" });
     }
@@ -6220,6 +6238,48 @@ app.post("/live-classes/create", async (req, res) => {
        RETURNING *`,
       [teacherId, title, subjectId || null, meetingLink, classTime, resolvedClassName]
     );
+
+    if (resolvedClassName) {
+      const audience = await pool.query(
+        `SELECT u.id
+         FROM students s
+         JOIN users u ON u.id = s.user_id
+         WHERE LOWER(TRIM(COALESCE(s.class_name, ''))) = LOWER(TRIM($1))
+           AND u.id <> $2`,
+        [resolvedClassName, user.id]
+      );
+
+      const readableTime = new Date(classTime).toLocaleString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      });
+      const notificationTitle = "New live class scheduled";
+      const notificationMessage = `${title} has been scheduled for ${readableTime}. Open Live Classes to join when it starts.`;
+
+      for (const recipient of audience.rows) {
+        await pool.query(
+          `INSERT INTO notifications (user_id, title, message, type, is_read, created_at)
+           VALUES ($1, $2, $3, 'live_class', false, NOW())`,
+          [recipient.id, notificationTitle, notificationMessage]
+        );
+      }
+
+      await sendPushToUserIds(
+        audience.rows.map((item) => item.id),
+        {
+          title: notificationTitle,
+          body: notificationMessage,
+          data: {
+            type: "live_class",
+            live_class_id: String(result.rows[0].id || ""),
+            class_name: resolvedClassName,
+          },
+        }
+      );
+    }
 
     res.status(201).json(result.rows[0]);
   } catch (e) {
