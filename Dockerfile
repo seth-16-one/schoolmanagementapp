@@ -1,21 +1,16 @@
-# Use official Node.js LTS image
 FROM node:20
 
-# Set working directory
 WORKDIR /usr/src/app
 
-# Copy package files
-COPY package*.json ./
+# Use the backend package files explicitly so Docker never installs from the repo root package.json.
+COPY school_backend/package*.json ./
 
-# Install dependencies
 RUN npm install
 
-# Copy all project files
-COPY . .
+# Copy only the backend app sources into the image.
+COPY school_backend/ ./
 
-# Expose port (Back4App uses environment variable)
 ENV PORT=3000
-EXPOSE $PORT
+EXPOSE 3000
 
-# Start the app
-CMD ["node", "index.js"]
+CMD ["npm", "start"]
