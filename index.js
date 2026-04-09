@@ -273,7 +273,9 @@ async function markUserPresenceById(userId, isActive = true) {
 async function getUserByEmail(email) {
   const normalizedEmail = normalizeEmail(email);
   const result = await pool.query(
-    `SELECT id, username, email, role, last_login, is_active
+    `SELECT id, username, email, role, last_login, is_active,
+            COALESCE(authenticator_enabled, false) AS authenticator_enabled,
+            authenticator_secret
      FROM users
      WHERE email = $1
      LIMIT 1`,
@@ -1338,7 +1340,12 @@ async function resolveOtpDestinations(user) {
 function getOtpMailer() {
   if (otpMailer) return otpMailer;
   const user = String(process.env.EMAIL_USER || "").trim();
-  const pass = String(process.env.EMAIL_PASSWORD || "").trim();
+  const pass = String(
+    process.env.EMAIL_PASSWORD ||
+    process.env.EMAIL_APP_PASSWORD ||
+    process.env.GMAIL_APP_PASSWORD ||
+    ""
+  ).trim();
   if (!user || !pass) {
     throw new Error("EMAIL_USER and EMAIL_PASSWORD must be configured for OTP delivery");
   }
@@ -1347,6 +1354,21 @@ function getOtpMailer() {
     auth: { user, pass },
   });
   return otpMailer;
+}
+
+function buildClientSafeAuthError(defaultMessage, error, extras = {}) {
+  const statusCode = Number(error?.statusCode) || 500;
+  const safeMessage =
+    statusCode >= 500
+      ? defaultMessage
+      : String(error?.message || defaultMessage).trim() || defaultMessage;
+  return {
+    statusCode,
+    body: {
+      error: safeMessage,
+      ...extras,
+    },
+  };
 }
 
 async function deliverOtp({ user, channel, destination, code }) {
@@ -1573,16 +1595,29 @@ app.post("/finance-login", async (req, res) => {
   }
 });
 
+app.get("/login-otp/request", (req, res) => {
+  return res.status(405).json({
+    error: "Use POST for /login-otp/request",
+    requiredBody: ["username", "password"],
+    acceptedAliases: ["usernameOrEmail", "password", "expectedRole", "channel"],
+  });
+});
+
 app.post("/login-otp/request", async (req, res) => {
-  const {
-    usernameOrEmail,
-    password,
-    expectedRole,
-    channel,
-  } = req.body;
+  const usernameOrEmail = String(
+    req.body.usernameOrEmail ?? req.body.username ?? req.body.email ?? ""
+  ).trim();
+  const password = String(req.body.password ?? "").trim();
+  const expectedRole = req.body.expectedRole;
+  const channel = req.body.channel;
 
   if (!usernameOrEmail || !password) {
-    return res.status(400).json({ error: "Username/email and password required" });
+    return res.status(400).json({
+      error: "Username/email and password required",
+      expectedMethod: "POST",
+      expectedContentType: "application/json",
+      requiredBody: ["username", "password"],
+    });
   }
 
   cleanupExpiredOtpChallenges();
@@ -1679,53 +1714,66 @@ app.post("/login-otp/request", async (req, res) => {
     });
   } catch (e) {
     console.error("Login OTP Request Error:", e);
-    return res.status(e.statusCode || 500).json({
-      error: e.message,
-      retryAt: e.retryAt ? new Date(e.retryAt).toISOString() : undefined,
-    });
+    const safeError = buildClientSafeAuthError(
+      "Failed to fetch verification code. Please try again.",
+      e,
+      {
+        retryAt: e.retryAt ? new Date(e.retryAt).toISOString() : undefined,
+      }
+    );
+    return res.status(safeError.statusCode).json(safeError.body);
   }
 });
 
 app.post("/login-otp/verify", async (req, res) => {
-  const { challengeId, code } = req.body;
+  try {
+    const { challengeId, code } = req.body;
 
-  if (!challengeId || !code) {
-    return res.status(400).json({ error: "Challenge ID and verification code required" });
-  }
-
-  cleanupExpiredOtpChallenges();
-  const challenge = otpChallenges.get(challengeId);
-
-  if (!challenge) {
-    return res.status(404).json({ error: "OTP challenge expired or was not found" });
-  }
-
-  if (challenge.expiresAt <= Date.now()) {
-    otpChallenges.delete(challengeId);
-    return res.status(410).json({ error: "OTP challenge has expired" });
-  }
-
-  challenge.attempts += 1;
-  const isAuthenticatorFlow = challenge.channel === "authenticator";
-  const isValidCode = isAuthenticatorFlow
-    ? verifyAuthenticatorToken(challenge.user?.authenticator_secret, code)
-    : String(code).trim() === challenge.code;
-
-  if (!isValidCode) {
-    if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
-      otpChallenges.delete(challengeId);
-      return res.status(429).json({ error: "Too many incorrect verification attempts" });
+    if (!challengeId || !code) {
+      return res.status(400).json({ error: "Challenge ID and verification code required" });
     }
 
-    return res.status(401).json({
-      error: "Invalid verification code",
-      remainingAttempts: OTP_MAX_ATTEMPTS - challenge.attempts,
-    });
-  }
+    cleanupExpiredOtpChallenges();
+    const challenge = otpChallenges.get(challengeId);
 
-  otpChallenges.delete(challengeId);
-  const session = await recordLoginSession(req, challenge.user);
-  return res.status(200).json({ user: challenge.user, session });
+    if (!challenge) {
+      return res.status(404).json({ error: "OTP challenge expired or was not found" });
+    }
+
+    if (challenge.expiresAt <= Date.now()) {
+      otpChallenges.delete(challengeId);
+      return res.status(410).json({ error: "OTP challenge has expired" });
+    }
+
+    challenge.attempts += 1;
+    const isAuthenticatorFlow = challenge.channel === "authenticator";
+    const isValidCode = isAuthenticatorFlow
+      ? verifyAuthenticatorToken(challenge.user?.authenticator_secret, code)
+      : String(code).trim() === challenge.code;
+
+    if (!isValidCode) {
+      if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
+        otpChallenges.delete(challengeId);
+        return res.status(429).json({ error: "Too many incorrect verification attempts" });
+      }
+
+      return res.status(401).json({
+        error: "Invalid verification code",
+        remainingAttempts: OTP_MAX_ATTEMPTS - challenge.attempts,
+      });
+    }
+
+    otpChallenges.delete(challengeId);
+    const session = await recordLoginSession(req, challenge.user);
+    return res.status(200).json({ user: challenge.user, session });
+  } catch (e) {
+    console.error("Login OTP Verify Error:", e);
+    const safeError = buildClientSafeAuthError(
+      "Failed to verify the login code. Please try again.",
+      e
+    );
+    return res.status(safeError.statusCode).json(safeError.body);
+  }
 });
 
 app.post("/password-reset/request", async (req, res) => {
@@ -3246,12 +3294,21 @@ app.get("/live-classes/:studentEmail", async (req, res) => {
       FROM live_classes lc
       LEFT JOIN teachers t ON t.id = lc.teacher_id
       LEFT JOIN subjects sub ON sub.id = lc.subject_id
-      JOIN students s
-        ON lc.class_name IS NULL
-        OR lc.class_name = ''
-        OR LOWER(TRIM(COALESCE(s.class_name, ''))) = LOWER(TRIM(COALESCE(lc.class_name, '')))
-      JOIN users u ON s.user_id = u.id
-      WHERE u.email = $1
+      LEFT JOIN (
+        SELECT LOWER(TRIM(COALESCE(s.class_name, ''))) AS student_class_name
+        FROM students s
+        JOIN users u ON s.user_id = u.id
+        WHERE u.email = $1
+        LIMIT 1
+      ) student_profile ON true
+      WHERE COALESCE(student_profile.student_class_name, '') = ''
+         OR lc.class_name IS NULL
+         OR TRIM(COALESCE(lc.class_name, '')) = ''
+         OR LOWER(
+              REGEXP_REPLACE(TRIM(COALESCE(lc.class_name, '')), '\\s+', '', 'g')
+            ) = LOWER(
+              REGEXP_REPLACE(COALESCE(student_profile.student_class_name, ''), '\\s+', '', 'g')
+            )
       ORDER BY lc.class_time DESC`,
       [normalizeEmail(studentEmail)]
     );
@@ -4593,6 +4650,17 @@ app.get("/chat/discover/:email", async (req, res) => {
                   )
               ) AS is_friend,
               (
+                SELECT fr.id
+                FROM friend_requests fr
+                WHERE (
+                  (fr.sender_id = $1 AND fr.receiver_id = u.id)
+                  OR
+                  (fr.sender_id = u.id AND fr.receiver_id = $1)
+                )
+                ORDER BY fr.created_at DESC
+                LIMIT 1
+              ) AS request_id,
+              (
                 SELECT fr.status
                 FROM friend_requests fr
                 WHERE (
@@ -4786,6 +4854,45 @@ app.post("/chat/friend-requests/:id/respond", async (req, res) => {
   } catch (e) {
     console.error("Respond Friend Request Error:", e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/friend-requests/:id/cancel", async (req, res) => {
+  const requestId = req.params.id;
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+
+  try {
+    const actor = await getUserByEmail(actorEmail);
+    if (!actor) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const requestResult = await pool.query(
+      `SELECT *
+       FROM friend_requests
+       WHERE id = $1
+       LIMIT 1`,
+      [requestId]
+    );
+
+    if (requestResult.rows.length === 0) {
+      return res.status(404).json({ error: "Friend request not found" });
+    }
+
+    const request = requestResult.rows[0];
+    if (request.sender_id !== actor.id) {
+      return res.status(403).json({ error: "Only the sender can cancel this request" });
+    }
+
+    if (request.status !== 'pending') {
+      return res.status(400).json({ error: "Only pending friend requests can be canceled" });
+    }
+
+    await pool.query(`DELETE FROM friend_requests WHERE id = $1`, [requestId]);
+    return res.json({ success: true, id: requestId, status: 'canceled' });
+  } catch (e) {
+    console.error("Cancel Friend Request Error:", e);
+    return res.status(500).json({ error: e.message });
   }
 });
 
