@@ -2,14 +2,18 @@ FROM node:20
 
 WORKDIR /usr/src/app
 
-# Use the backend package files explicitly so Docker never installs from the repo root package.json.
-COPY package*.json ./
+# Copy dependency manifests first for better layer caching.
+COPY . .
 
 RUN npm install
 
-# Copy only the backend app sources into the image.
+# Copy the backend app files into the image.
 
 
+# Debug step for Render builds: verify index.js and package files are present.
+RUN ls -la
+
+ENV NODE_ENV=production
 ENV PORT=3000
 EXPOSE 3000
 
