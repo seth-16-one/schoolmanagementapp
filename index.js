@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const speakeasy = require("speakeasy");
 const { v4: uuidv4 } = require("uuid");
+const { createRealtimeChatModule } = require("./realtime_chat_module");
 
 const app = express();
 app.use(cors());
@@ -32,6 +33,191 @@ app.get("/health", (req, res) => {
     service: "school_backend",
     timestamp: new Date().toISOString(),
   });
+});
+
+app.post("/otp/request", requireOtpApiKey, async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const requestIp = getRequestIp(req);
+  const userAgent = String(req.headers["user-agent"] || "").trim() || null;
+
+  try {
+    const purpose = normalizeOtpPurpose(req.body.purpose);
+    assertValidEmailOrThrow(email);
+    await assertSecureOtpRequestAllowed({ email, purpose, requestIp });
+    await ensureSecureOtpSchema();
+
+    await pool.query(
+      `UPDATE email_otp_challenges
+       SET consumed_at = CURRENT_TIMESTAMP
+       WHERE email = $1
+         AND purpose = $2
+         AND consumed_at IS NULL
+         AND verified_at IS NULL`,
+      [email, purpose]
+    );
+
+    const challengeId = uuidv4();
+    const code = generateOtpCode();
+    const otpHash = buildSecureOtpHash({
+      challengeId,
+      email,
+      purpose,
+      code,
+    });
+    const expiresAt = new Date(Date.now() + SECURE_OTP_EXPIRY_MS);
+
+    await pool.query(
+      `INSERT INTO email_otp_challenges (
+         id,
+         email,
+         purpose,
+         otp_hash,
+         request_ip,
+         user_agent,
+         attempt_count,
+         max_attempts,
+         expires_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8)`,
+      [
+        challengeId,
+        email,
+        purpose,
+        otpHash,
+        requestIp,
+        userAgent,
+        SECURE_OTP_MAX_ATTEMPTS,
+        expiresAt,
+      ]
+    );
+
+    await sendSecureOtpEmail({ email, code, purpose });
+
+    return res.status(200).json({
+      success: true,
+      challengeId,
+      purpose,
+      destinationMasked: maskValue(email, "email"),
+      expiresAt: expiresAt.toISOString(),
+      requestLimit: SECURE_OTP_REQUEST_LIMIT,
+      requestWindowMinutes: Math.round(SECURE_OTP_REQUEST_WINDOW_MS / 60000),
+    });
+  } catch (e) {
+    console.error("Secure OTP Request Error:", e);
+    return res.status(e.statusCode || 500).json({
+      error: e.message || "Failed to request OTP",
+    });
+  }
+});
+
+app.post("/otp/verify", requireOtpApiKey, async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const challengeId = String(req.body.challengeId || "").trim();
+  const code = String(req.body.code || "").trim();
+
+  if (!challengeId || !code) {
+    return res.status(400).json({ error: "challengeId and code are required" });
+  }
+
+  try {
+    const purpose = normalizeOtpPurpose(req.body.purpose);
+    assertValidEmailOrThrow(email);
+    await ensureSecureOtpSchema();
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query(
+        `SELECT *
+         FROM email_otp_challenges
+         WHERE id = $1
+           AND email = $2
+           AND purpose = $3
+         LIMIT 1
+         FOR UPDATE`,
+        [challengeId, email, purpose]
+      );
+
+      if (!result.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "OTP challenge not found" });
+      }
+
+      const challenge = result.rows[0];
+      const now = new Date();
+      if (challenge.consumed_at || challenge.verified_at) {
+        await client.query("ROLLBACK");
+        return res.status(410).json({ error: "OTP has already been used or invalidated" });
+      }
+
+      if (new Date(challenge.expires_at).getTime() <= now.getTime()) {
+        await client.query(
+          `UPDATE email_otp_challenges
+           SET consumed_at = CURRENT_TIMESTAMP
+           WHERE id = $1`,
+          [challengeId]
+        );
+        await client.query("COMMIT");
+        return res.status(410).json({ error: "OTP has expired" });
+      }
+
+      const expectedHash = buildSecureOtpHash({
+        challengeId,
+        email,
+        purpose,
+        code,
+      });
+      const nextAttemptCount = Number(challenge.attempt_count || 0) + 1;
+
+      if (expectedHash !== challenge.otp_hash) {
+        const shouldLock = nextAttemptCount >= Number(challenge.max_attempts || SECURE_OTP_MAX_ATTEMPTS);
+        await client.query(
+          `UPDATE email_otp_challenges
+           SET attempt_count = $2,
+               last_attempt_at = CURRENT_TIMESTAMP,
+               consumed_at = CASE WHEN $3 THEN CURRENT_TIMESTAMP ELSE consumed_at END
+           WHERE id = $1`,
+          [challengeId, nextAttemptCount, shouldLock]
+        );
+        await client.query("COMMIT");
+        return res.status(shouldLock ? 429 : 401).json({
+          error: shouldLock
+            ? "Too many incorrect verification attempts"
+            : "Invalid verification code",
+          remainingAttempts: shouldLock
+            ? 0
+            : Math.max(0, Number(challenge.max_attempts || SECURE_OTP_MAX_ATTEMPTS) - nextAttemptCount),
+        });
+      }
+
+      await client.query(
+        `UPDATE email_otp_challenges
+         SET attempt_count = $2,
+             last_attempt_at = CURRENT_TIMESTAMP,
+             verified_at = CURRENT_TIMESTAMP,
+             consumed_at = CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [challengeId, nextAttemptCount]
+      );
+      await client.query("COMMIT");
+
+      return res.status(200).json({
+        success: true,
+        email,
+        purpose,
+        verifiedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error("Secure OTP Verify Error:", e);
+    return res.status(e.statusCode || 500).json({
+      error: e.message || "Failed to verify OTP",
+    });
+  }
 });
 
 // ===================== AUTH =====================
@@ -93,12 +279,25 @@ function getRequestIp(req) {
   );
 }
 
+app.use(
+  "/api/realtime-chat",
+  createRealtimeChatModule({
+    pool,
+    getRequestIp,
+  })
+);
+
 let pushDeviceSchemaEnsured = false;
 let authenticatorSchemaEnsured = false;
+let secureOtpSchemaEnsured = false;
 let firebaseAccessTokenCache = {
   token: null,
   expiresAt: 0,
 };
+const SECURE_OTP_EXPIRY_MS = Number(process.env.SECURE_OTP_EXPIRY_MS || 5 * 60 * 1000);
+const SECURE_OTP_MAX_ATTEMPTS = Number(process.env.SECURE_OTP_MAX_ATTEMPTS || OTP_MAX_ATTEMPTS || 5);
+const SECURE_OTP_REQUEST_LIMIT = Number(process.env.SECURE_OTP_REQUEST_LIMIT || 5);
+const SECURE_OTP_REQUEST_WINDOW_MS = Number(process.env.SECURE_OTP_REQUEST_WINDOW_MS || 15 * 60 * 1000);
 
 async function ensurePushDeviceSchema() {
   if (pushDeviceSchemaEnsured) return;
@@ -131,6 +330,154 @@ async function ensureAuthenticatorSchema() {
     ADD COLUMN IF NOT EXISTS authenticator_enabled boolean NOT NULL DEFAULT false
   `);
   authenticatorSchemaEnsured = true;
+}
+
+async function ensureSecureOtpSchema() {
+  if (secureOtpSchemaEnsured) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS email_otp_challenges (
+      id uuid PRIMARY KEY,
+      email text NOT NULL,
+      purpose text NOT NULL DEFAULT 'general',
+      otp_hash text NOT NULL,
+      request_ip text,
+      user_agent text,
+      attempt_count integer NOT NULL DEFAULT 0,
+      max_attempts integer NOT NULL DEFAULT 5,
+      expires_at timestamp without time zone NOT NULL,
+      verified_at timestamp without time zone,
+      consumed_at timestamp without time zone,
+      last_attempt_at timestamp without time zone,
+      created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_email_otp_challenges_email_purpose_created
+    ON email_otp_challenges(email, purpose, created_at DESC)
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_email_otp_challenges_expires
+    ON email_otp_challenges(expires_at)
+  `);
+  secureOtpSchemaEnsured = true;
+}
+
+function getSecureOtpApiKey() {
+  return String(process.env.OTP_API_KEY || process.env.INTERNAL_API_KEY || "").trim();
+}
+
+function requireOtpApiKey(req, res, next) {
+  const configuredApiKey = getSecureOtpApiKey();
+  if (!configuredApiKey) {
+    return res.status(500).json({
+      error: "OTP API key is not configured on the server",
+    });
+  }
+
+  const headerApiKey = String(req.headers["x-api-key"] || "").trim();
+  const bearerToken = String(req.headers.authorization || "")
+    .replace(/^Bearer\s+/i, "")
+    .trim();
+  const providedApiKey = headerApiKey || bearerToken;
+
+  if (!providedApiKey || providedApiKey !== configuredApiKey) {
+    return res.status(401).json({ error: "Invalid API key" });
+  }
+
+  next();
+}
+
+function assertValidEmailOrThrow(email) {
+  if (!isValidEmail(email)) {
+    const error = new Error("A valid email address is required");
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
+function normalizeOtpPurpose(purpose) {
+  const normalized = String(purpose || "general").trim().toLowerCase();
+  if (!/^[a-z0-9:_-]{1,50}$/.test(normalized)) {
+    const error = new Error("Purpose must contain only letters, numbers, colon, underscore, or hyphen");
+    error.statusCode = 400;
+    throw error;
+  }
+  return normalized;
+}
+
+function buildSecureOtpHash({ challengeId, email, purpose, code }) {
+  const secret = String(process.env.OTP_HASH_SECRET || "").trim();
+  if (!secret) {
+    const error = new Error("OTP_HASH_SECRET is not configured on the server");
+    error.statusCode = 500;
+    throw error;
+  }
+  return crypto
+    .createHmac("sha256", secret)
+    .update([challengeId, normalizeEmail(email), normalizeOtpPurpose(purpose), String(code || "").trim()].join(":"))
+    .digest("hex");
+}
+
+async function assertSecureOtpRequestAllowed({ email, purpose, requestIp }) {
+  await ensureSecureOtpSchema();
+  const windowStart = new Date(Date.now() - SECURE_OTP_REQUEST_WINDOW_MS);
+  const normalizedEmail = normalizeEmail(email);
+  const normalizedPurpose = normalizeOtpPurpose(purpose);
+
+  const emailCountResult = await pool.query(
+    `SELECT COUNT(*)::int AS count
+     FROM email_otp_challenges
+     WHERE email = $1
+       AND purpose = $2
+       AND created_at >= $3`,
+    [normalizedEmail, normalizedPurpose, windowStart]
+  );
+  const emailCount = Number(emailCountResult.rows[0]?.count || 0);
+  if (emailCount >= SECURE_OTP_REQUEST_LIMIT) {
+    const error = new Error("Too many OTP requests for this email. Try again later.");
+    error.statusCode = 429;
+    throw error;
+  }
+
+  if (requestIp) {
+    const ipCountResult = await pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM email_otp_challenges
+       WHERE request_ip = $1
+         AND created_at >= $2`,
+      [requestIp, windowStart]
+    );
+    const ipCount = Number(ipCountResult.rows[0]?.count || 0);
+    if (ipCount >= SECURE_OTP_REQUEST_LIMIT) {
+      const error = new Error("Too many OTP requests from this network. Try again later.");
+      error.statusCode = 429;
+      throw error;
+    }
+  }
+}
+
+async function sendSecureOtpEmail({ email, code, purpose }) {
+  const transporter = getOtpMailer();
+  const from = String(process.env.OTP_FROM_EMAIL || process.env.EMAIL_USER || "").trim();
+  const subject = `Your eSchool ${purpose} verification code`;
+  const expiryMinutes = Math.max(1, Math.round(SECURE_OTP_EXPIRY_MS / 60000));
+  await transporter.sendMail({
+    from,
+    to: email,
+    subject,
+    text: `Your eSchool verification code is ${code}. It expires in ${expiryMinutes} minutes. If you did not request this code, please ignore this email.`,
+    html: `
+      <div style="font-family:Arial,sans-serif;color:#0f172a;">
+        <h2 style="margin-bottom:8px;">eSchool Verification</h2>
+        <p>Your one-time verification code for <strong>${purpose}</strong> is:</p>
+        <div style="font-size:30px;font-weight:800;letter-spacing:6px;margin:16px 0;color:#1d4ed8;">
+          ${code}
+        </div>
+        <p>This code expires in <strong>${expiryMinutes} minutes</strong>.</p>
+        <p>If you did not request this code, you can ignore this email.</p>
+      </div>
+    `,
+  });
 }
 
 function buildAuthenticatorLabel(user) {
