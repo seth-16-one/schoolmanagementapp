@@ -4,6 +4,9 @@ const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
+const crypto = require("crypto");
+const nodemailer = require("nodemailer");
+const speakeasy = require("speakeasy");
 const { v4: uuidv4 } = require("uuid");
 
 const app = express();
@@ -35,10 +38,16 @@ app.get("/health", (req, res) => {
 
 const otpChallenges = new Map();
 const passwordResetChallenges = new Map();
-const OTP_EXPIRY_MS = Number(process.env.OTP_EXPIRY_MS || 10 * 60 * 1000);
+const appLockResetChallenges = new Map();
+const pendingAuthenticatorSetups = new Map();
+const otpRequestWindows = new Map();
+const passwordResetRequestWindows = new Map();
+const OTP_EXPIRY_MS = Number(process.env.OTP_EXPIRY_MS || 5 * 60 * 1000);
 const OTP_MAX_ATTEMPTS = Number(process.env.OTP_MAX_ATTEMPTS || 5);
-const OTP_DEV_PREVIEW = process.env.OTP_DEV_PREVIEW !== "false";
+const OTP_REQUEST_LIMIT = Number(process.env.OTP_REQUEST_LIMIT || 5);
+const OTP_REQUEST_WINDOW_MS = Number(process.env.OTP_REQUEST_WINDOW_MS || 60 * 60 * 1000);
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+let otpMailer = null;
 
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
@@ -84,6 +93,234 @@ function getRequestIp(req) {
   );
 }
 
+let pushDeviceSchemaEnsured = false;
+let authenticatorSchemaEnsured = false;
+let firebaseAccessTokenCache = {
+  token: null,
+  expiresAt: 0,
+};
+
+async function ensurePushDeviceSchema() {
+  if (pushDeviceSchemaEnsured) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS push_devices (
+      id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      device_token text NOT NULL UNIQUE,
+      platform text,
+      app_role text,
+      device_name text,
+      app_version text,
+      is_active boolean NOT NULL DEFAULT true,
+      last_seen_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_push_devices_user_active
+    ON push_devices(user_id, is_active, last_seen_at DESC)
+  `);
+  pushDeviceSchemaEnsured = true;
+}
+
+async function ensureAuthenticatorSchema() {
+  if (authenticatorSchemaEnsured) return;
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS authenticator_secret text,
+    ADD COLUMN IF NOT EXISTS authenticator_enabled boolean NOT NULL DEFAULT false
+  `);
+  authenticatorSchemaEnsured = true;
+}
+
+function buildAuthenticatorLabel(user) {
+  const identity = user.email || user.username || "user";
+  return `eSchool (${identity})`;
+}
+
+function generateAuthenticatorSecret(user) {
+  return speakeasy.generateSecret({
+    name: buildAuthenticatorLabel(user),
+    issuer: "eSchool",
+    length: 20,
+  });
+}
+
+function verifyAuthenticatorToken(secret, token) {
+  const normalizedToken = String(token || "").replace(/\s+/g, "").trim();
+  if (!secret || normalizedToken.length !== 6) return false;
+  return speakeasy.totp.verify({
+    secret,
+    encoding: "base32",
+    token: normalizedToken,
+    window: 1,
+  });
+}
+
+async function getActivePushTokensForUserIds(userIds = []) {
+  await ensurePushDeviceSchema();
+  const normalizedIds = userIds.filter(Boolean);
+  if (!normalizedIds.length) return [];
+  const result = await pool.query(
+    `SELECT user_id, device_token
+     FROM push_devices
+     WHERE user_id = ANY($1::uuid[])
+       AND is_active = true`,
+    [normalizedIds]
+  );
+  return result.rows;
+}
+
+function getFirebaseServiceAccount() {
+  const projectId = String(process.env.FIREBASE_PROJECT_ID || "").trim();
+  const clientEmail = String(process.env.FIREBASE_CLIENT_EMAIL || "").trim();
+  const privateKey = String(process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n").trim();
+  if (!projectId || !clientEmail || !privateKey) {
+    return null;
+  }
+  return {
+    projectId,
+    clientEmail,
+    privateKey,
+  };
+}
+
+function toBase64Url(input) {
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+async function getFirebaseAccessToken() {
+  const serviceAccount = getFirebaseServiceAccount();
+  if (!serviceAccount) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (
+    firebaseAccessTokenCache.token &&
+    firebaseAccessTokenCache.expiresAt - 60 > now
+  ) {
+    return firebaseAccessTokenCache.token;
+  }
+
+  const header = {
+    alg: "RS256",
+    typ: "JWT",
+  };
+  const payload = {
+    iss: serviceAccount.clientEmail,
+    scope: "https://www.googleapis.com/auth/firebase.messaging",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  };
+
+  const encodedHeader = toBase64Url(JSON.stringify(header));
+  const encodedPayload = toBase64Url(JSON.stringify(payload));
+  const unsignedToken = `${encodedHeader}.${encodedPayload}`;
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(unsignedToken);
+  signer.end();
+  const signature = signer
+    .sign(serviceAccount.privateKey, "base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: `${unsignedToken}.${signature}`,
+    }),
+  });
+
+  if (!response.ok) {
+    const raw = await response.text();
+    throw new Error(`Failed to get Firebase access token: ${response.status} ${raw}`);
+  }
+
+  const data = await response.json();
+  firebaseAccessTokenCache = {
+    token: data.access_token,
+    expiresAt: now + Number(data.expires_in || 3600),
+  };
+  return firebaseAccessTokenCache.token;
+}
+
+async function sendPushToUserIds(userIds = [], { title, body, data = {} }) {
+  const serviceAccount = getFirebaseServiceAccount();
+  if (!serviceAccount || typeof fetch !== "function") return;
+  const devices = await getActivePushTokensForUserIds(userIds);
+  if (!devices.length) return;
+  const accessToken = await getFirebaseAccessToken();
+  if (!accessToken) return;
+
+  const normalizedData = Object.entries(data || {}).reduce((acc, [key, value]) => {
+    acc[key] = value == null ? "" : String(value);
+    return acc;
+  }, {});
+
+  await Promise.allSettled(
+    devices.map(async ({ device_token }) => {
+      try {
+        const response = await fetch(
+          `https://fcm.googleapis.com/v1/projects/${serviceAccount.projectId}/messages:send`,
+          {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${accessToken}`,
+          },
+          body: JSON.stringify({
+            message: {
+              token: device_token,
+              notification: {
+                title: String(title || "eSchool"),
+                body: String(body || ""),
+              },
+              android: {
+                priority: "high",
+                notification: {
+                  channel_id: "chat_alerts_channel",
+                },
+              },
+              data: normalizedData,
+            },
+          }),
+        });
+
+        if (!response.ok) {
+          const raw = await response.text();
+          console.error("FCM Push Error:", response.status, raw);
+          if (
+            raw.includes("UNREGISTERED") ||
+            raw.includes("registration-token-not-registered") ||
+            response.status === 404 ||
+            response.status === 410
+          ) {
+            await pool.query(
+              `UPDATE push_devices
+               SET is_active = false,
+                   last_seen_at = NOW()
+               WHERE device_token = $1`,
+              [device_token]
+            );
+          }
+          return;
+        }
+      } catch (error) {
+        console.error("FCM Push Dispatch Error:", error);
+      }
+    })
+  );
+}
+
 async function recordLoginSession(req, user) {
   try {
     if (!user?.id) return null;
@@ -116,6 +353,26 @@ async function recordLoginSession(req, user) {
        RETURNING id, logged_in_at, ip_address, device_info, suspicious, is_current`,
       [user.id, user.role, ipAddress, deviceInfo, suspicious]
     );
+
+    if (suspicious) {
+      const title = "New login from another device";
+      const message = `A new ${user.role || "account"} login was detected from ${ipAddress || "an unknown IP"}. If this was not you, review your active devices now.`;
+      try {
+        await pool.query(
+          `INSERT INTO notifications (user_id, title, message, type, is_read, created_at)
+           VALUES ($1, $2, $3, 'security_alert', false, NOW())`,
+          [user.id, title, message]
+        );
+      } catch (_) {}
+      await sendPushToUserIds([user.id], {
+        title,
+        body: message,
+        data: {
+          type: "security_alert",
+          email: user.email,
+        },
+      });
+    }
 
     return result.rows[0] || null;
   } catch (e) {
@@ -563,7 +820,9 @@ async function getNextStudentAdmissionNumber(client = pool) {
 }
 
 function normalizeOtpChannel(channel) {
-  return String(channel || "email").toLowerCase().trim();
+  const normalized = String(channel || "email").toLowerCase().trim();
+  if (normalized === "authenticator") return "authenticator";
+  return "email";
 }
 
 function cleanupExpiredOtpChallenges() {
@@ -582,6 +841,50 @@ function cleanupExpiredPasswordResetChallenges() {
       passwordResetChallenges.delete(challengeId);
     }
   }
+}
+
+function cleanupExpiredAppLockResetChallenges() {
+  const now = Date.now();
+  for (const [challengeId, challenge] of appLockResetChallenges.entries()) {
+    if (challenge.expiresAt <= now) {
+      appLockResetChallenges.delete(challengeId);
+    }
+  }
+}
+
+function cleanupRequestWindow(store) {
+  const now = Date.now();
+  for (const [key, entry] of store.entries()) {
+    const timestamps = (entry?.timestamps || []).filter(
+      (timestamp) => now - timestamp < OTP_REQUEST_WINDOW_MS
+    );
+    if (!timestamps.length) {
+      store.delete(key);
+      continue;
+    }
+    entry.timestamps = timestamps;
+  }
+}
+
+function assertOtpRequestAllowed(store, key) {
+  cleanupRequestWindow(store);
+  const now = Date.now();
+  const current = store.get(key) || { timestamps: [] };
+  current.timestamps = current.timestamps.filter(
+    (timestamp) => now - timestamp < OTP_REQUEST_WINDOW_MS
+  );
+  if (current.timestamps.length >= OTP_REQUEST_LIMIT) {
+    const retryAt = current.timestamps[0] + OTP_REQUEST_WINDOW_MS;
+    const waitMinutes = Math.max(1, Math.ceil((retryAt - now) / 60000));
+    const error = new Error(
+      `Too many OTP requests. Try again in about ${waitMinutes} minute(s).`
+    );
+    error.statusCode = 429;
+    error.retryAt = retryAt;
+    throw error;
+  }
+  current.timestamps.push(now);
+  store.set(key, current);
 }
 
 function generateOtpCode() {
@@ -607,8 +910,11 @@ function maskValue(value, type = "email") {
 }
 
 async function authenticateAdminLogin(usernameOrEmail, password) {
+  await ensureAuthenticatorSchema();
   const result = await pool.query(
-    `SELECT u.id, u.username, u.email, u.password_hash, u.role
+    `SELECT u.id, u.username, u.email, u.password_hash, u.role,
+            COALESCE(u.authenticator_enabled, false) AS authenticator_enabled,
+            u.authenticator_secret
      FROM users u
      LEFT JOIN admins a ON a.user_id = u.id
      WHERE (u.username = $1 OR u.email = $1) AND u.role = 'admin'
@@ -658,118 +964,65 @@ async function resolveOtpDestinations(user) {
   const destinations = {};
   if (user.email) {
     destinations.email = user.email;
-  }
-
-  try {
-    if (user.role === "student") {
-      const result = await pool.query(
-        `SELECT s.phone
-         FROM students s
-         JOIN users u ON s.user_id = u.id
-         WHERE u.email = $1
-         LIMIT 1`,
-        [user.email]
-      );
-      const phone = result.rows[0]?.phone;
-      if (phone) destinations.sms = phone;
+    if (user.authenticator_enabled) {
+      destinations.authenticator = user.email;
     }
-
-    if (user.role === "teacher") {
-      const result = await pool.query(
-        `SELECT t.phone
-         FROM teachers t
-         JOIN users u ON t.user_id = u.id
-         WHERE u.email = $1
-         LIMIT 1`,
-        [user.email]
-      );
-      const phone = result.rows[0]?.phone;
-      if (phone) destinations.sms = phone;
-    }
-
-    if (user.role === "parent") {
-      const result = await pool.query(
-        `SELECT p.phone
-         FROM parents p
-         JOIN users u ON p.user_id = u.id
-         WHERE u.email = $1
-         LIMIT 1`,
-        [user.email]
-      );
-      const phone = result.rows[0]?.phone;
-      if (phone) destinations.sms = phone;
-    }
-
-    if (user.role === "admin") {
-      const result = await pool.query(
-        `SELECT a.phone
-         FROM admins a
-         JOIN users u ON a.user_id = u.id
-         WHERE u.email = $1
-         LIMIT 1`,
-        [user.email]
-      );
-      const phone = result.rows[0]?.phone;
-      if (phone) destinations.sms = phone;
-    }
-  } catch (e) {
-    console.error("Resolve OTP destinations error:", e);
   }
 
   return destinations;
 }
 
-function getOtpWebhookUrl(channel) {
-  if (channel === "sms") {
-    return process.env.OTP_SMS_WEBHOOK_URL || process.env.OTP_WEBHOOK_URL || null;
+function getOtpMailer() {
+  if (otpMailer) return otpMailer;
+  const user = String(process.env.EMAIL_USER || "").trim();
+  const pass = String(process.env.EMAIL_PASSWORD || "").trim();
+  if (!user || !pass) {
+    throw new Error("EMAIL_USER and EMAIL_PASSWORD must be configured for OTP delivery");
   }
-  return process.env.OTP_EMAIL_WEBHOOK_URL || process.env.OTP_WEBHOOK_URL || null;
+  otpMailer = nodemailer.createTransport({
+    service: "gmail",
+    auth: { user, pass },
+  });
+  return otpMailer;
 }
 
 async function deliverOtp({ user, channel, destination, code }) {
-  const webhookUrl = getOtpWebhookUrl(channel);
-  const message = `Your eSchool verification code is ${code}. It expires in 10 minutes.`;
+  const normalizedChannel = channel === "authenticator" ? "email" : "email";
+  const expiresMinutes = Math.round(OTP_EXPIRY_MS / 60000);
+  const transporter = getOtpMailer();
+  const subject =
+    normalizedChannel === "email"
+      ? "Your eSchool verification code"
+      : "Your eSchool authenticator verification code";
+  const message = `Your eSchool verification code is ${code}. It expires in ${expiresMinutes} minutes.`;
 
-  if (webhookUrl) {
-    try {
-      const response = await fetch(webhookUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          channel,
-          destination,
-          code,
-          message,
-          user: {
-            id: user.id,
-            email: user.email,
-            role: user.role,
-            username: user.username
-          }
-        })
-      });
+  await transporter.sendMail({
+    from: process.env.EMAIL_USER,
+    to: destination,
+    subject,
+    text: `${message}\n\nIf you did not request this code, you can ignore this email.`,
+    html: `
+      <div style="font-family: Arial, sans-serif; color: #0f172a;">
+        <h2 style="margin-bottom: 8px;">eSchool Verification</h2>
+        <p>Hello ${user.username || user.email},</p>
+        <p>Your verification code is:</p>
+        <div style="font-size: 28px; font-weight: 800; letter-spacing: 6px; margin: 16px 0; color: #1d4ed8;">
+          ${code}
+        </div>
+        <p>This code expires in <strong>${expiresMinutes} minutes</strong>.</p>
+        <p>If you did not request this code, you can ignore this email.</p>
+      </div>
+    `,
+  });
 
-      if (!response.ok) {
-        throw new Error(`Webhook responded with ${response.status}`);
-      }
-
-      return {
-        deliveryMode: "webhook",
-        previewCode: null
-      };
-    } catch (e) {
-      console.error(`OTP ${channel} webhook failed:`, e);
-    }
-  }
-
-  console.log(`[OTP ${channel.toUpperCase()}] ${destination} => ${code}`);
   return {
-    deliveryMode: "preview",
-    previewCode: OTP_DEV_PREVIEW ? code : null
+    deliveryMode: "email",
+    previewCode: null
   };
 }
 
 async function loginUserFromUsersTable(usernameOrEmail, password, enforcedRole = null) {
+  await ensureAuthenticatorSchema();
   const result = await pool.query(
     "SELECT * FROM users WHERE username = $1 OR email = $1",
     [usernameOrEmail]
@@ -972,15 +1225,22 @@ app.post("/login-otp/request", async (req, res) => {
   cleanupExpiredOtpChallenges();
 
   try {
+    await ensureAuthenticatorSchema();
     const authResult = await authenticateLoginAttempt(usernameOrEmail, password, expectedRole);
     if (authResult.status !== 200) {
       return res.status(authResult.status).json(authResult.body);
     }
 
     const user = authResult.body.user;
+    assertOtpRequestAllowed(
+      otpRequestWindows,
+      `login:${normalizeEmail(user.email || usernameOrEmail)}`
+    );
     const requestedChannel = normalizeOtpChannel(channel);
     const destinations = await resolveOtpDestinations(user);
-    const availableChannels = Object.keys(destinations);
+    const availableChannels = destinations.authenticator
+      ? ["email", "authenticator"]
+      : ["email"];
 
     if (!availableChannels.length) {
       return res.status(400).json({
@@ -988,27 +1248,47 @@ app.post("/login-otp/request", async (req, res) => {
       });
     }
 
-    if (!destinations[requestedChannel]) {
+    if (requestedChannel === "authenticator" && !destinations.authenticator) {
       return res.status(400).json({
-        error: `${requestedChannel.toUpperCase()} OTP is not available for this account`,
+        error: "Authenticator is not enabled for this account yet",
         availableChannels,
         maskedDestinations: {
           email: maskValue(destinations.email, "email"),
-          sms: maskValue(destinations.sms, "phone"),
+        }
+      });
+    }
+
+    if (!destinations.email && requestedChannel !== "authenticator") {
+      return res.status(400).json({
+        error: `Email OTP is not available for this account`,
+        availableChannels,
+        maskedDestinations: {
+          email: maskValue(destinations.email, "email"),
         }
       });
     }
 
     const challengeId = uuidv4();
-    const code = generateOtpCode();
     const expiresAt = Date.now() + OTP_EXPIRY_MS;
-    const destination = destinations[requestedChannel];
-    const delivery = await deliverOtp({
-      user,
-      channel: requestedChannel,
-      destination,
-      code,
-    });
+    let delivery;
+    let code = null;
+    let destination = null;
+
+    if (requestedChannel === "authenticator") {
+      delivery = {
+        deliveryMode: "authenticator",
+        previewCode: null,
+      };
+    } else {
+      code = generateOtpCode();
+      destination = destinations.email;
+      delivery = await deliverOtp({
+        user,
+        channel: "email",
+        destination,
+        code,
+      });
+    }
 
     otpChallenges.set(challengeId, {
       attempts: 0,
@@ -1021,14 +1301,14 @@ app.post("/login-otp/request", async (req, res) => {
     return res.status(200).json({
       challengeId,
       channel: requestedChannel,
-      destinationMasked: maskValue(
-        destination,
-        requestedChannel === "sms" ? "phone" : "email"
-      ),
+      destinationMasked:
+        requestedChannel === "authenticator"
+          ? "your authenticator app"
+          : maskValue(destination, "email"),
       availableChannels,
       maskedDestinations: {
         email: maskValue(destinations.email, "email"),
-        sms: maskValue(destinations.sms, "phone"),
+        authenticator: destinations.authenticator ? "your authenticator app" : null,
       },
       expiresAt: new Date(expiresAt).toISOString(),
       deliveryMode: delivery.deliveryMode,
@@ -1036,7 +1316,10 @@ app.post("/login-otp/request", async (req, res) => {
     });
   } catch (e) {
     console.error("Login OTP Request Error:", e);
-    return res.status(500).json({ error: e.message });
+    return res.status(e.statusCode || 500).json({
+      error: e.message,
+      retryAt: e.retryAt ? new Date(e.retryAt).toISOString() : undefined,
+    });
   }
 });
 
@@ -1060,7 +1343,12 @@ app.post("/login-otp/verify", async (req, res) => {
   }
 
   challenge.attempts += 1;
-  if (String(code).trim() !== challenge.code) {
+  const isAuthenticatorFlow = challenge.channel === "authenticator";
+  const isValidCode = isAuthenticatorFlow
+    ? verifyAuthenticatorToken(challenge.user?.authenticator_secret, code)
+    : String(code).trim() === challenge.code;
+
+  if (!isValidCode) {
     if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
       otpChallenges.delete(challengeId);
       return res.status(429).json({ error: "Too many incorrect verification attempts" });
@@ -1105,6 +1393,10 @@ app.post("/password-reset/request", async (req, res) => {
     }
 
     const user = result.rows[0];
+    assertOtpRequestAllowed(
+      passwordResetRequestWindows,
+      `password:${normalizeEmail(user.email || usernameOrEmail)}`
+    );
     const normalizedExpectedRole = expectedRole
       ? String(expectedRole).toLowerCase().trim()
       : null;
@@ -1116,7 +1408,7 @@ app.post("/password-reset/request", async (req, res) => {
 
     const requestedChannel = normalizeOtpChannel(channel);
     const destinations = await resolveOtpDestinations(user);
-    const availableChannels = Object.keys(destinations);
+    const availableChannels = ["email"];
 
     if (!availableChannels.length) {
       return res.status(400).json({
@@ -1124,13 +1416,12 @@ app.post("/password-reset/request", async (req, res) => {
       });
     }
 
-    if (!destinations[requestedChannel]) {
+    if (!destinations.email) {
       return res.status(400).json({
-        error: `${requestedChannel.toUpperCase()} password reset code is not available for this account`,
+        error: `Email password reset code is not available for this account`,
         availableChannels,
         maskedDestinations: {
           email: maskValue(destinations.email, "email"),
-          sms: maskValue(destinations.sms, "phone"),
         }
       });
     }
@@ -1138,10 +1429,10 @@ app.post("/password-reset/request", async (req, res) => {
     const challengeId = uuidv4();
     const code = generateOtpCode();
     const expiresAt = Date.now() + OTP_EXPIRY_MS;
-    const destination = destinations[requestedChannel];
+    const destination = destinations.email;
     const delivery = await deliverOtp({
       user,
-      channel: requestedChannel,
+      channel: "email",
       destination,
       code,
     });
@@ -1150,21 +1441,17 @@ app.post("/password-reset/request", async (req, res) => {
       attempts: 0,
       code,
       user,
-      channel: requestedChannel,
+      channel: "email",
       expiresAt,
     });
 
     return res.status(200).json({
       challengeId,
-      channel: requestedChannel,
-      destinationMasked: maskValue(
-        destination,
-        requestedChannel === "sms" ? "phone" : "email"
-      ),
+      channel: "email",
+      destinationMasked: maskValue(destination, "email"),
       availableChannels,
       maskedDestinations: {
         email: maskValue(destinations.email, "email"),
-        sms: maskValue(destinations.sms, "phone"),
       },
       expiresAt: new Date(expiresAt).toISOString(),
       deliveryMode: delivery.deliveryMode,
@@ -1172,7 +1459,10 @@ app.post("/password-reset/request", async (req, res) => {
     });
   } catch (e) {
     console.error("Password Reset Request Error:", e);
-    return res.status(500).json({ error: e.message });
+    return res.status(e.statusCode || 500).json({
+      error: e.message,
+      retryAt: e.retryAt ? new Date(e.retryAt).toISOString() : undefined,
+    });
   }
 });
 
@@ -1224,6 +1514,196 @@ app.post("/password-reset/confirm", async (req, res) => {
     return res.status(200).json({ success: true });
   } catch (e) {
     console.error("Password Reset Confirm Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/app-lock/reset/request", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  if (!email) {
+    return res.status(400).json({ error: "Email is required" });
+  }
+
+  cleanupExpiredAppLockResetChallenges();
+
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "Account not found" });
+    }
+
+    assertOtpRequestAllowed(passwordResetRequestWindows, `applock:${email}`);
+    const code = generateOtpCode();
+    const challengeId = uuidv4();
+    const expiresAt = Date.now() + OTP_EXPIRY_MS;
+    await deliverOtp({
+      user,
+      channel: "email",
+      destination: user.email,
+      code,
+    });
+
+    appLockResetChallenges.set(challengeId, {
+      user,
+      code,
+      attempts: 0,
+      expiresAt,
+    });
+
+    return res.status(200).json({
+      challengeId,
+      destinationMasked: maskValue(user.email, "email"),
+      expiresAt: new Date(expiresAt).toISOString(),
+    });
+  } catch (e) {
+    console.error("App Lock Reset Request Error:", e);
+    return res.status(e.statusCode || 500).json({
+      error: e.message,
+      retryAt: e.retryAt ? new Date(e.retryAt).toISOString() : undefined,
+    });
+  }
+});
+
+app.post("/app-lock/reset/confirm", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const challengeId = String(req.body.challengeId || "").trim();
+  const code = String(req.body.code || "").trim();
+
+  if (!email || !challengeId || !code) {
+    return res.status(400).json({ error: "Email, challengeId, and code are required" });
+  }
+
+  cleanupExpiredAppLockResetChallenges();
+  const challenge = appLockResetChallenges.get(challengeId);
+  if (!challenge || normalizeEmail(challenge.user?.email) !== email) {
+    return res.status(404).json({ error: "Reset challenge expired or was not found" });
+  }
+  if (challenge.expiresAt <= Date.now()) {
+    appLockResetChallenges.delete(challengeId);
+    return res.status(410).json({ error: "Reset code has expired" });
+  }
+
+  challenge.attempts += 1;
+  if (code !== challenge.code) {
+    if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
+      appLockResetChallenges.delete(challengeId);
+      return res.status(429).json({ error: "Too many incorrect verification attempts" });
+    }
+    return res.status(401).json({
+      error: "Invalid verification code",
+      remainingAttempts: OTP_MAX_ATTEMPTS - challenge.attempts,
+    });
+  }
+
+  appLockResetChallenges.delete(challengeId);
+  return res.status(200).json({ success: true });
+});
+
+app.get("/authenticator/status/:email", async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  try {
+    await ensureAuthenticatorSchema();
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    return res.json({
+      enabled: user.authenticator_enabled === true,
+      email: user.email,
+    });
+  } catch (e) {
+    console.error("Authenticator Status Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/authenticator/setup/request", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  try {
+    await ensureAuthenticatorSchema();
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const secret = generateAuthenticatorSecret(user);
+    pendingAuthenticatorSetups.set(email, {
+      secret: secret.base32,
+      otpauthUrl: secret.otpauth_url,
+      createdAt: Date.now(),
+    });
+
+    return res.json({
+      email: user.email,
+      manualEntryKey: secret.base32,
+      otpauthUrl: secret.otpauth_url,
+      issuer: "eSchool",
+      accountLabel: buildAuthenticatorLabel(user),
+    });
+  } catch (e) {
+    console.error("Authenticator Setup Request Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/authenticator/setup/confirm", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const code = String(req.body.code || "").trim();
+  try {
+    await ensureAuthenticatorSchema();
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    const pending = pendingAuthenticatorSetups.get(email);
+    if (!pending) {
+      return res.status(404).json({ error: "No pending authenticator setup found" });
+    }
+    if (!verifyAuthenticatorToken(pending.secret, code)) {
+      return res.status(401).json({ error: "Invalid authenticator code" });
+    }
+
+    await pool.query(
+      `UPDATE users
+       SET authenticator_secret = $2,
+           authenticator_enabled = true
+       WHERE id = $1`,
+      [user.id, pending.secret]
+    );
+    pendingAuthenticatorSetups.delete(email);
+    return res.json({ success: true, enabled: true });
+  } catch (e) {
+    console.error("Authenticator Setup Confirm Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/authenticator/disable", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const code = String(req.body.code || "").trim();
+  try {
+    await ensureAuthenticatorSchema();
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (!user.authenticator_enabled || !user.authenticator_secret) {
+      return res.status(400).json({ error: "Authenticator is not enabled" });
+    }
+    if (!verifyAuthenticatorToken(user.authenticator_secret, code)) {
+      return res.status(401).json({ error: "Invalid authenticator code" });
+    }
+
+    await pool.query(
+      `UPDATE users
+       SET authenticator_secret = NULL,
+           authenticator_enabled = false
+       WHERE id = $1`,
+      [user.id]
+    );
+    return res.json({ success: true, enabled: false });
+  } catch (e) {
+    console.error("Authenticator Disable Error:", e);
     return res.status(500).json({ error: e.message });
   }
 });
@@ -2589,6 +3069,74 @@ app.get("/login-sessions/:email", async (req, res) => {
   }
 });
 
+app.post("/push/devices/register", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const deviceToken = String(req.body.deviceToken || "").trim();
+  const platform = String(req.body.platform || "android").trim().toLowerCase();
+  const appRole = String(req.body.appRole || "").trim().toLowerCase() || null;
+  const deviceName = String(req.body.deviceName || "").trim() || null;
+  const appVersion = String(req.body.appVersion || "").trim() || null;
+
+  try {
+    if (!email || !deviceToken) {
+      return res.status(400).json({ error: "email and deviceToken are required" });
+    }
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    await ensurePushDeviceSchema();
+    await pool.query(
+      `INSERT INTO push_devices (
+         user_id,
+         device_token,
+         platform,
+         app_role,
+         device_name,
+         app_version,
+         is_active,
+         last_seen_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, true, NOW())
+       ON CONFLICT (device_token)
+       DO UPDATE SET
+         user_id = EXCLUDED.user_id,
+         platform = EXCLUDED.platform,
+         app_role = EXCLUDED.app_role,
+         device_name = EXCLUDED.device_name,
+         app_version = EXCLUDED.app_version,
+         is_active = true,
+         last_seen_at = NOW()`,
+      [user.id, deviceToken, platform, appRole, deviceName, appVersion]
+    );
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("Register Push Device Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/push/devices/unregister", async (req, res) => {
+  const deviceToken = String(req.body.deviceToken || "").trim();
+  try {
+    if (!deviceToken) {
+      return res.status(400).json({ error: "deviceToken is required" });
+    }
+    await ensurePushDeviceSchema();
+    await pool.query(
+      `UPDATE push_devices
+       SET is_active = false,
+           last_seen_at = NOW()
+       WHERE device_token = $1`,
+      [deviceToken]
+    );
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("Unregister Push Device Error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/login-sessions/logout-others", async (req, res) => {
   const email = normalizeEmail(req.body.email);
   const currentSessionId = String(req.body.currentSessionId || "").trim();
@@ -2673,6 +3221,7 @@ app.post("/admin/notifications/broadcast", async (req, res) => {
         : `SELECT id, role FROM users WHERE id <> $1 AND role = $2`,
       audience === 'all' ? [admin.id] : [admin.id, audience]
     );
+    const recipientIds = usersResult.rows.map((user) => user.id);
 
     for (const user of usersResult.rows) {
       try {
@@ -2735,6 +3284,14 @@ app.post("/admin/notifications/broadcast", async (req, res) => {
     }
 
     await client.query("COMMIT");
+    await sendPushToUserIds(recipientIds, {
+      title,
+      body: message,
+      data: {
+        type,
+        audience,
+      },
+    });
     res.status(201).json({ ok: true, recipients: usersResult.rows.length });
   } catch (e) {
     await client.query("ROLLBACK");
@@ -4173,6 +4730,17 @@ app.post("/chat/thread/send", async (req, res) => {
 
     setTypingState(sender.id, receiver.id, false);
 
+    await sendPushToUserIds([receiver.id], {
+      title: sender.username || sender.email || "New message",
+      body: message.trim() || "Sent you a message",
+      data: {
+        type: "chat_message",
+        senderEmail: sender.email,
+        receiverEmail: receiver.email,
+        messageType,
+      },
+    });
+
     res.status(201).json(result.rows[0]);
   } catch (e) {
     console.error("Send Chat Message Error:", e);
@@ -4852,6 +5420,28 @@ app.post("/chat/groups/:groupId/messages", async (req, res) => {
         replyToMessageId,
         forwardedFromMessageId,
       ]
+    );
+
+    const membersResult = await pool.query(
+      `SELECT user_id
+       FROM chat_group_members
+       WHERE group_id = $1
+         AND user_id <> $2`,
+      [groupId, sender.id]
+    );
+
+    await sendPushToUserIds(
+      membersResult.rows.map((member) => member.user_id),
+      {
+        title: `New message in group`,
+        body: message.trim() || "Shared media in the group",
+        data: {
+          type: "group_message",
+          groupId,
+          senderEmail: sender.email,
+          messageType,
+        },
+      }
     );
 
     res.status(201).json(result.rows[0]);
