@@ -1371,22 +1371,32 @@ function buildClientSafeAuthError(defaultMessage, error, extras = {}) {
   };
 }
 
-async function deliverOtp({ user, channel, destination, code }) {
+async function deliverOtp({ user, channel, destination, code, purpose = null }) {
   const normalizedChannel = channel === "authenticator" ? "email" : "email";
   const expiresMinutes = Math.round(OTP_EXPIRY_MS / 60000);
   const transporter = getOtpMailer();
-  const subject =
-    normalizedChannel === "email"
+  
+  const isAppLockReset = purpose === 'app_lock';
+  const subject = isAppLockReset
+    ? "Your eSchool PIN Reset Code"
+    : normalizedChannel === "email"
       ? "Your eSchool verification code"
       : "Your eSchool authenticator verification code";
-  const message = `Your eSchool verification code is ${code}. It expires in ${expiresMinutes} minutes.`;
-
-  await transporter.sendMail({
-    from: process.env.EMAIL_USER,
-    to: destination,
-    subject,
-    text: `${message}\n\nIf you did not request this code, you can ignore this email.`,
-    html: `
+  
+  const html = isAppLockReset
+    ? `
+      <div style="font-family: Arial, sans-serif; color: #0f172a;">
+        <h2 style="margin-bottom: 8px;">eSchool PIN Reset Request</h2>
+        <p>Hello ${user.username || user.email},</p>
+        <p>You requested a PIN reset for your eSchool account. Use this 6-digit code to set a new PIN:</p>
+        <div style="font-size: 36px; font-weight: 800; letter-spacing: 8px; margin: 20px 0; color: #1d4ed8; font-family: 'Courier New', monospace; text-align: center;">
+          ${code}
+        </div>
+        <p>This code expires in <strong>${expiresMinutes} minutes</strong>.</p>
+        <p style="color: #666; font-size: 14px;">If you did not request this PIN reset, please ignore this email and your PIN will remain unchanged.</p>
+      </div>
+    `
+    : `
       <div style="font-family: Arial, sans-serif; color: #0f172a;">
         <h2 style="margin-bottom: 8px;">eSchool Verification</h2>
         <p>Hello ${user.username || user.email},</p>
@@ -1397,7 +1407,16 @@ async function deliverOtp({ user, channel, destination, code }) {
         <p>This code expires in <strong>${expiresMinutes} minutes</strong>.</p>
         <p>If you did not request this code, you can ignore this email.</p>
       </div>
-    `,
+    `;
+
+  await transporter.sendMail({
+    from: process.env.EMAIL_USER,
+    to: destination,
+    subject,
+    text: isAppLockReset 
+      ? `Your PIN reset code is: ${code}\n\nExpires in ${expiresMinutes} minutes.`
+      : `Your verification code is ${code}. It expires in ${expiresMinutes} minutes.`,
+    html,
   });
 
   return {
