@@ -235,6 +235,20 @@ function createRealtimeChatModule({
       )
     `);
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS public.student_statuses (
+        id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+        student_email text NOT NULL,
+        student_name text,
+        avatar_url text,
+        text_content text,
+        media_type text CHECK (media_type IN ('text', 'image', 'video')),
+        media_url text,
+        created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at timestamp without time zone NOT NULL DEFAULT (CURRENT_TIMESTAMP + interval '24 hours'),
+        is_deleted boolean NOT NULL DEFAULT false
+      )
+    `);
+    await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_realtime_messages_conversation_created
       ON public.realtime_messages(conversation_id, created_at DESC)
     `);
@@ -249,6 +263,14 @@ function createRealtimeChatModule({
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_realtime_typing_expires
       ON public.realtime_typing_status(expires_at)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_student_statuses_email_created
+      ON public.student_statuses(student_email, created_at DESC)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_student_statuses_expires_at
+      ON public.student_statuses(expires_at)
     `);
     schemaEnsured = true;
   }
@@ -1026,6 +1048,81 @@ function createRealtimeChatModule({
       return res.status(e.statusCode || 500).json({ error: e.message });
     } finally {
       client.release();
+    }
+  });
+
+  router.get("/statuses", async (req, res) => {
+    try {
+      await ensureSchema();
+      const viewerEmail = normalizeEmail(req.query.viewer_email);
+      const result = await pool.query(
+        `SELECT id, student_email, student_name, avatar_url, text_content, media_type, media_url, created_at, expires_at, is_deleted
+         FROM public.student_statuses
+         WHERE is_deleted = false
+           AND expires_at > CURRENT_TIMESTAMP
+           AND ($1 = '' OR student_email = $1)
+         ORDER BY created_at DESC`,
+        [viewerEmail]
+      );
+      return res.status(200).json({ items: result.rows });
+    } catch (e) {
+      return res.status(e.statusCode || 500).json({ error: e.message });
+    }
+  });
+
+  router.post("/statuses", async (req, res) => {
+    try {
+      await ensureSchema();
+      const studentEmail = normalizeEmail(req.body.student_email);
+      const studentName = normalizeText(req.body.student_name);
+      const avatarUrl = normalizeText(req.body.avatar_url);
+      const textContent = normalizeText(req.body.text_content);
+      const mediaType = normalizeText(req.body.media_type).toLowerCase() || (textContent ? "text" : "");
+      const mediaUrl = normalizeText(req.body.media_url);
+      assertRequired(studentEmail, "student_email");
+      if (!textContent && !mediaUrl) {
+        return res.status(400).json({ error: "Status text or media is required" });
+      }
+      if (mediaType && !["text", "image", "video"].includes(mediaType)) {
+        return res.status(400).json({ error: "Invalid status media type" });
+      }
+      const expiresAt =
+        req.body.expires_at && normalizeText(req.body.expires_at)
+          ? new Date(req.body.expires_at)
+          : new Date(Date.now() + 24 * 60 * 60 * 1000);
+      const result = await pool.query(
+        `INSERT INTO public.student_statuses (
+           student_email, student_name, avatar_url, text_content, media_type, media_url, expires_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id, student_email, student_name, avatar_url, text_content, media_type, media_url, created_at, expires_at, is_deleted`,
+        [studentEmail, studentName || null, avatarUrl || null, textContent || null, mediaType || null, mediaUrl || null, expiresAt]
+      );
+      return res.status(201).json(result.rows[0]);
+    } catch (e) {
+      return res.status(e.statusCode || 500).json({ error: e.message });
+    }
+  });
+
+  router.delete("/statuses/:statusId", async (req, res) => {
+    try {
+      await ensureSchema();
+      const statusId = normalizeText(req.params.statusId);
+      const actorEmail = normalizeEmail(req.body.actor_email || req.query.actor_email);
+      assertRequired(statusId, "statusId");
+      assertRequired(actorEmail, "actor_email");
+      const result = await pool.query(
+        `UPDATE public.student_statuses
+         SET is_deleted = true
+         WHERE id = $1 AND student_email = $2
+         RETURNING id`,
+        [statusId, actorEmail]
+      );
+      if (!result.rows.length) {
+        return res.status(404).json({ error: "Status not found or delete not allowed" });
+      }
+      return res.status(200).json({ success: true, id: statusId });
+    } catch (e) {
+      return res.status(e.statusCode || 500).json({ error: e.message });
     }
   });
 
