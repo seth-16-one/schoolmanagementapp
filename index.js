@@ -284,6 +284,22 @@ async function getUserByEmail(email) {
   return result.rows[0] || null;
 }
 
+async function getUserDisplayName(userId, client = pool) {
+  if (!userId) return "";
+  const result = await client.query(
+    `SELECT COALESCE(s.full_name, t.full_name, p.full_name, a.full_name, u.username, u.email) AS display_name
+     FROM users u
+     LEFT JOIN students s ON s.user_id = u.id
+     LEFT JOIN teachers t ON t.user_id = u.id
+     LEFT JOIN parents p ON p.user_id = u.id
+     LEFT JOIN admins a ON a.user_id = u.id
+     WHERE u.id = $1
+     LIMIT 1`,
+    [userId]
+  );
+  return (result.rows[0]?.display_name || "").toString();
+}
+
 function getRequestIp(req) {
   const forwarded = req.headers["x-forwarded-for"];
   if (typeof forwarded === "string" && forwarded.trim()) {
@@ -881,14 +897,38 @@ async function syncChatFreezeForUser(userId) {
       `UPDATE users
        SET is_chat_frozen = true,
            chat_frozen_at = COALESCE(chat_frozen_at, NOW()),
-           chat_freeze_reason = $2
+           chat_freeze_reason = $2,
+           chat_freeze_expires_at = NULL
        WHERE id = $1`,
       [userId, `Chat frozen after missed appeal deadline: ${warning.reason}`]
+    );
+    await pool.query(
+      `UPDATE admin_warnings
+       SET appeal_status = CASE
+             WHEN COALESCE(appeal_status, '') IN ('', 'pending') THEN 'expired'
+             ELSE appeal_status
+           END,
+           resolution_note = COALESCE(
+             NULLIF(resolution_note, ''),
+             'Appeal deadline passed. Chat access frozen automatically.'
+           )
+       WHERE id = $1`,
+      [warning.id]
     );
     return {
       isFrozen: true,
       reason: `Chat frozen after missed appeal deadline: ${warning.reason}`,
-      warning,
+      warning: {
+        ...warning,
+        appeal_status:
+          warning.appeal_status && warning.appeal_status.trim().isNotEmpty
+            ? warning.appeal_status
+            : 'expired',
+        resolution_note:
+          warning.resolution_note && String(warning.resolution_note).trim().length > 0
+            ? warning.resolution_note
+            : 'Appeal deadline passed. Chat access frozen automatically.',
+      },
       appealDeadlineAt: warning.appeal_deadline_at,
     };
   }
@@ -944,6 +984,19 @@ async function syncChatFreezeForUser(userId) {
     warning,
     appealDeadlineAt: warning?.appeal_deadline_at || null,
   };
+}
+
+async function ensureLiveClassParticipantSchema(client = pool) {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS live_class_participants (
+      id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+      live_class_id uuid NOT NULL REFERENCES live_classes(id) ON DELETE CASCADE,
+      student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+      user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+      joined_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (live_class_id, student_id)
+    )
+  `);
 }
 
 async function ensureChatAccessAllowed(user) {
@@ -1060,15 +1113,53 @@ function canManageGroupMembers(membership) {
   return membership.is_admin === true || membership.role === 'admin' || membership.role === 'moderator';
 }
 
+function canSendGroupMessages(membership, sendPermissions) {
+  if (!membership) return false;
+  const mode = String(sendPermissions || 'admins_moderators').trim().toLowerCase();
+  if (mode === 'all_members') return true;
+  return membership.is_admin === true || membership.role === 'admin' || membership.role === 'moderator';
+}
+
+function buildGroupInviteCode() {
+  return crypto.randomBytes(12).toString("hex");
+}
+
+function buildPublicBaseUrl(req) {
+  const configuredBaseUrl = String(
+    process.env.PUBLIC_BASE_URL || process.env.APP_BASE_URL || ""
+  ).trim().replace(/\/+$/, "");
+  if (configuredBaseUrl) return configuredBaseUrl;
+  return `${req.protocol}://${req.get("host")}`.replace(/\/+$/, "");
+}
+
 async function ensureChatGroupRoleSchema(client = pool) {
   await client.query(
     `ALTER TABLE public.chat_group_members
      ADD COLUMN IF NOT EXISTS role text DEFAULT 'member'`
   );
   await client.query(
+    `ALTER TABLE public.chat_groups
+     ADD COLUMN IF NOT EXISTS invite_code text,
+     ADD COLUMN IF NOT EXISTS send_permissions text DEFAULT 'admins_moderators'`
+  );
+  await client.query(
     `UPDATE public.chat_group_members
      SET role = CASE WHEN is_admin = true THEN 'admin' ELSE 'member' END
      WHERE role IS NULL OR role = ''`
+  );
+  await client.query(
+    `UPDATE public.chat_groups
+     SET send_permissions = 'admins_moderators'
+     WHERE send_permissions IS NULL OR send_permissions = ''`
+  );
+  await client.query(
+    `UPDATE public.chat_groups
+     SET invite_code = substr(md5(random()::text || clock_timestamp()::text || id::text), 1, 24)
+     WHERE invite_code IS NULL OR invite_code = ''`
+  );
+  await client.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_groups_invite_code
+     ON public.chat_groups (invite_code)`
   );
 }
 
@@ -5537,7 +5628,7 @@ app.delete("/chat/messages/:messageId", async (req, res) => {
     }
 
     const messageResult = await pool.query(
-      `SELECT id, sender_id
+      `SELECT id, sender_id, group_id
        FROM messages
        WHERE id = $1
        LIMIT 1`,
@@ -5552,9 +5643,22 @@ app.delete("/chat/messages/:messageId", async (req, res) => {
     if (message.sender_id !== actor.id) {
       return res.status(403).json({ error: "Only the sender can delete this message" });
     }
-
-    await pool.query(`DELETE FROM messages WHERE id = $1`, [messageId]);
-    res.json({ ok: true });
+    const actorName = (await getUserDisplayName(actor.id)).trim() || actor.email;
+    const deletedLabel = `${actorName} deleted this message`;
+    const updated = await pool.query(
+      `UPDATE messages
+       SET message = $2,
+           message_type = 'deleted',
+           media_url = NULL,
+           thumbnail_url = NULL,
+           duration_seconds = NULL,
+           reply_to_message_id = NULL,
+           forwarded_from_message_id = NULL
+       WHERE id = $1
+       RETURNING *`,
+      [messageId, deletedLabel]
+    );
+    res.json(updated.rows[0] || { ok: true });
   } catch (e) {
     console.error("Delete Message Error:", e);
     res.status(500).json({ error: e.message });
@@ -5578,6 +5682,7 @@ app.get("/chat/groups/:email", async (req, res) => {
       `SELECT g.id,
               g.name,
               g.avatar_url,
+              COALESCE(g.send_permissions, 'admins_moderators') AS send_permissions,
               g.created_at,
               COUNT(DISTINCT members.user_id) AS member_count,
               MAX(m.created_at) AS last_message_at
@@ -5631,10 +5736,10 @@ app.post("/chat/groups", async (req, res) => {
 
     await client.query("BEGIN");
     const groupResult = await client.query(
-      `INSERT INTO chat_groups (name, created_by, avatar_url)
-       VALUES ($1, $2, $3)
+      `INSERT INTO chat_groups (name, created_by, avatar_url, invite_code, send_permissions)
+       VALUES ($1, $2, $3, $4, 'admins_moderators')
        RETURNING *`,
-      [name, creator.id, avatarUrl]
+      [name, creator.id, avatarUrl, buildGroupInviteCode()]
     );
     const group = groupResult.rows[0];
 
@@ -5837,19 +5942,21 @@ app.post("/chat/groups/:groupId/messages", async (req, res) => {
       return res.status(access.status).json({ error: access.error });
     }
 
-    const membership = await pool.query(
-      `SELECT id
+    const membershipResult = await pool.query(
+      `SELECT id, is_admin, COALESCE(role, 'member') AS role
        FROM chat_group_members
        WHERE group_id = $1 AND user_id = $2
        LIMIT 1`,
       [groupId, sender.id]
     );
-    if (membership.rows.length === 0) {
+    if (membershipResult.rows.length === 0) {
       return res.status(403).json({ error: "You are not a member of this group" });
     }
+    const membership = membershipResult.rows[0];
 
     const groupCheck = await pool.query(
-      `SELECT is_closed FROM chat_groups WHERE id = $1 LIMIT 1`,
+      `SELECT is_closed, COALESCE(send_permissions, 'admins_moderators') AS send_permissions
+       FROM chat_groups WHERE id = $1 LIMIT 1`,
       [groupId]
     );
     if (groupCheck.rows.length === 0) {
@@ -5857,6 +5964,11 @@ app.post("/chat/groups/:groupId/messages", async (req, res) => {
     }
     if (groupCheck.rows[0].is_closed === true) {
       return res.status(403).json({ error: "This group has been closed by the admin" });
+    }
+    if (!canSendGroupMessages(membership, groupCheck.rows[0].send_permissions)) {
+      return res.status(403).json({
+        error: "Only group admins and moderators can send messages in this group",
+      });
     }
 
     if (!message.trim() && !mediaUrl) {
@@ -5961,6 +6073,7 @@ app.get("/chat/groups/:groupId/details/:email", async (req, res) => {
               COALESCE(cs.full_name, ct.full_name, cp.full_name, ca.full_name, creator.username, creator.email) AS created_by_name,
               membership.is_admin,
               membership.role,
+              COALESCE(g.send_permissions, 'admins_moderators') AS send_permissions,
               (
                 SELECT array_agg(lower(u.email))
                 FROM chat_group_members gm
@@ -6023,6 +6136,123 @@ app.get("/chat/groups/:groupId/members", async (req, res) => {
   } catch (e) {
     console.error("Get Group Members Error:", e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/chat/groups/:groupId/invite-link/:email", async (req, res) => {
+  const groupId = req.params.groupId;
+  const email = normalizeEmail(req.params.email);
+  try {
+    await ensureChatGroupRoleSchema();
+    const user = await getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const membership = await getGroupMembership(groupId, user.id);
+    if (!membership || !canManageGroupMembers(membership)) {
+      return res.status(403).json({ error: "Only a group admin or moderator can share invite links" });
+    }
+
+    const groupResult = await pool.query(
+      `SELECT id, name, invite_code
+       FROM chat_groups
+       WHERE id = $1
+       LIMIT 1`,
+      [groupId]
+    );
+    if (groupResult.rows.length === 0) {
+      return res.status(404).json({ error: "Group not found" });
+    }
+
+    let group = groupResult.rows[0];
+    if (!group.invite_code) {
+      const updated = await pool.query(
+        `UPDATE chat_groups
+         SET invite_code = $2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1
+         RETURNING id, name, invite_code`,
+        [groupId, buildGroupInviteCode()]
+      );
+      group = updated.rows[0];
+    }
+
+    const inviteLink = `${buildPublicBaseUrl(req)}/chat/groups/join/${group.invite_code}`;
+    res.json({
+      group_id: group.id,
+      group_name: group.name,
+      invite_code: group.invite_code,
+      invite_link: inviteLink,
+    });
+  } catch (e) {
+    console.error("Get Group Invite Link Error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/chat/groups/join-by-link", async (req, res) => {
+  const actorEmail = normalizeEmail(req.body.actorEmail);
+  const inviteValue = String(req.body.inviteLink || req.body.inviteCode || "").trim();
+  if (!actorEmail || !inviteValue) {
+    return res.status(400).json({ error: "Actor email and invite link/code are required" });
+  }
+
+  const inviteCodeMatch = inviteValue.match(/([a-f0-9]{24})$/i);
+  const inviteCode = inviteCodeMatch ? inviteCodeMatch[1].toLowerCase() : inviteValue.toLowerCase();
+  const client = await pool.connect();
+  try {
+    await ensureChatGroupRoleSchema(client);
+    const actor = await getUserByEmail(actorEmail);
+    if (!actor) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const access = await ensureChatAccessAllowed(actor);
+    if (!access.ok) {
+      return res.status(access.status).json({ error: access.error });
+    }
+
+    const groupResult = await client.query(
+      `SELECT id, name, is_closed
+       FROM chat_groups
+       WHERE invite_code = $1
+       LIMIT 1`,
+      [inviteCode]
+    );
+    if (groupResult.rows.length === 0) {
+      return res.status(404).json({ error: "Invite link is invalid" });
+    }
+
+    const group = groupResult.rows[0];
+    if (group.is_closed === true) {
+      return res.status(403).json({ error: "This group has been closed by the admin" });
+    }
+
+    const existingMembership = await getGroupMembership(group.id, actor.id, client);
+    if (existingMembership) {
+      return res.status(200).json({ ok: true, already_joined: true, group });
+    }
+
+    await client.query(
+      `INSERT INTO chat_group_members (group_id, user_id, is_admin, role)
+       VALUES ($1, $2, false, 'member')`,
+      [group.id, actor.id]
+    );
+    await insertGroupSystemMessage({
+      client,
+      groupId: group.id,
+      actorId: actor.id,
+      actorRole: actor.role,
+      message: `${actor.email} joined via invite link`,
+    });
+
+    res.status(201).json({ ok: true, already_joined: false, group });
+  } catch (e) {
+    console.error("Join Group By Link Error:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -6423,6 +6653,7 @@ app.post("/live-classes/:id/join", async (req, res) => {
   }
 
   try {
+    await ensureLiveClassParticipantSchema();
     const studentResult = await pool.query(
       `SELECT s.id, s.class_name, s.full_name, u.id AS user_id
        FROM students s
@@ -6459,34 +6690,23 @@ app.post("/live-classes/:id/join", async (req, res) => {
     ) {
       return res.status(403).json({ error: "This live class does not belong to the student's class" });
     }
-
-      const attendanceDate = (() => {
-        const parsed = liveClass.class_time ? new Date(liveClass.class_time) : new Date();
-        const y = parsed.getUTCFullYear();
-      const m = String(parsed.getUTCMonth() + 1).padStart(2, "0");
-      const d = String(parsed.getUTCDate()).padStart(2, "0");
-      return `${y}-${m}-${d}`;
-    })();
-
-    const attendanceResult = await pool.query(
-      `INSERT INTO attendance (student_id, date, status)
-       VALUES ($1, $2, 'present')
-       ON CONFLICT (student_id, date)
-       DO UPDATE SET status = CASE
-         WHEN attendance.status = 'absent' THEN 'present'
-         ELSE attendance.status
-       END
-       RETURNING id, student_id, date, status`,
-      [student.id, attendanceDate]
+    const participantResult = await pool.query(
+      `INSERT INTO live_class_participants (live_class_id, student_id, user_id, joined_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (live_class_id, student_id)
+       DO UPDATE SET joined_at = LEAST(live_class_participants.joined_at, EXCLUDED.joined_at)
+       RETURNING id, live_class_id, student_id, user_id, joined_at`,
+      [liveClass.id, student.id, student.user_id]
     );
 
-      return res.status(200).json({
-        ok: true,
-        counts_for_attendance: true,
-        host_type: liveClass.teacher_id ? "teacher" : "student",
-        live_class_id: liveClass.id,
-        attendance: attendanceResult.rows[0],
-      });
+    return res.status(200).json({
+      ok: true,
+      counts_for_attendance: false,
+      host_type: liveClass.teacher_id ? "teacher" : "student",
+      live_class_id: liveClass.id,
+      participant: participantResult.rows[0],
+      attendance: null,
+    });
   } catch (e) {
     console.error("Join Live Class Error:", e);
     res.status(500).json({ error: e.message });
@@ -6706,7 +6926,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`School Management Backend running on port ${PORT}`);
 });
-
-
-
-

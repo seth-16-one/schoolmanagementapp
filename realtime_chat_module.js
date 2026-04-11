@@ -93,6 +93,48 @@ function createRealtimeChatModule({
     return content;
   }
 
+  function normalizeMessageType(value) {
+    const type = normalizeText(value).toLowerCase() || "text";
+    if (!["text", "image", "audio"].includes(type)) {
+      const error = new Error("Unsupported message type");
+      error.statusCode = 400;
+      throw error;
+    }
+    return type;
+  }
+
+  function normalizeMediaUrl(value) {
+    const mediaUrl = String(value || "").trim();
+    if (!mediaUrl) return null;
+    if (mediaUrl.length > 2_000_000) {
+      const error = new Error("Media payload is too large");
+      error.statusCode = 400;
+      throw error;
+    }
+    return mediaUrl;
+  }
+
+  function assertMessagePayload({ content, mediaUrl, messageType }) {
+    const normalizedType = normalizeMessageType(messageType);
+    const normalizedContent = normalizeText(content);
+    const normalizedMediaUrl = normalizeMediaUrl(mediaUrl);
+    if (!normalizedContent && !normalizedMediaUrl) {
+      const error = new Error("Message content or media is required");
+      error.statusCode = 400;
+      throw error;
+    }
+    if (normalizedContent.length > 4000) {
+      const error = new Error("Message content is too long");
+      error.statusCode = 400;
+      throw error;
+    }
+    return {
+      content: normalizedContent,
+      mediaUrl: normalizedMediaUrl,
+      messageType: normalizedType,
+    };
+  }
+
   function assertStatus(value) {
     const status = normalizeText(value).toLowerCase();
     if (!["sent", "delivered", "seen"].includes(status)) {
@@ -140,12 +182,39 @@ function createRealtimeChatModule({
         conversation_id uuid NOT NULL REFERENCES public.realtime_conversations(id) ON DELETE CASCADE,
         sender_id text NOT NULL,
         content text NOT NULL,
+        message_type text NOT NULL DEFAULT 'text',
+        media_url text,
+        reactions jsonb NOT NULL DEFAULT '{}'::jsonb,
         group_id uuid REFERENCES public.realtime_conversations(id) ON DELETE CASCADE,
         status text NOT NULL DEFAULT 'sent' CHECK (status IN ('sent', 'delivered', 'seen')),
         delivered_at timestamp without time zone,
         seen_at timestamp without time zone,
         created_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
       )
+    `);
+    await pool.query(`
+      ALTER TABLE public.realtime_messages
+      ADD COLUMN IF NOT EXISTS message_type text NOT NULL DEFAULT 'text'
+    `);
+    await pool.query(`
+      ALTER TABLE public.realtime_messages
+      ADD COLUMN IF NOT EXISTS media_url text
+    `);
+    await pool.query(`
+      ALTER TABLE public.realtime_messages
+      ADD COLUMN IF NOT EXISTS reactions jsonb NOT NULL DEFAULT '{}'::jsonb
+    `);
+    await pool.query(`
+      ALTER TABLE public.realtime_messages
+      ADD COLUMN IF NOT EXISTS reply_to_message_id uuid REFERENCES public.realtime_messages(id) ON DELETE SET NULL
+    `);
+    await pool.query(`
+      ALTER TABLE public.realtime_messages
+      ADD COLUMN IF NOT EXISTS is_pinned boolean NOT NULL DEFAULT false
+    `);
+    await pool.query(`
+      ALTER TABLE public.realtime_messages
+      ADD COLUMN IF NOT EXISTS pinned_at timestamp without time zone
     `);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS public.realtime_typing_status (
@@ -218,7 +287,7 @@ function createRealtimeChatModule({
         beforeSql = `AND created_at < $3::timestamp`;
       }
       const result = await pool.query(
-        `SELECT id, conversation_id, sender_id, content, created_at, status, delivered_at, seen_at
+        `SELECT id, conversation_id, sender_id, content, message_type, media_url, reply_to_message_id, reactions, is_pinned, pinned_at, created_at, status, delivered_at, seen_at
          FROM public.realtime_messages
          WHERE conversation_id = $1
            ${beforeSql}
@@ -240,7 +309,12 @@ function createRealtimeChatModule({
       await ensureSchema();
       const conversationId = normalizeText(conversationIdOverride || req.body.conversation_id);
       const senderId = normalizeText(req.body.sender_id);
-      const content = assertMessageContent(req.body.content);
+      const payload = assertMessagePayload({
+        content: req.body.content,
+        mediaUrl: req.body.media_url,
+        messageType: req.body.message_type,
+      });
+      const replyToMessageId = normalizeText(req.body.reply_to_message_id) || null;
       assertRequired(conversationId, "conversation_id");
       assertRequired(senderId, "sender_id");
       enforceRateLimit({
@@ -258,17 +332,32 @@ function createRealtimeChatModule({
         throw error;
       }
 
+      if (replyToMessageId) {
+        const replyExists = await pool.query(
+          `SELECT id
+           FROM public.realtime_messages
+           WHERE id = $1 AND conversation_id = $2
+           LIMIT 1`,
+          [replyToMessageId, conversationId]
+        );
+        if (!replyExists.rows.length) {
+          const error = new Error("Reply target was not found in this conversation");
+          error.statusCode = 404;
+          throw error;
+        }
+      }
+
       const result = await pool.query(
         `INSERT INTO public.realtime_messages (
-           conversation_id, sender_id, content, group_id, status
+           conversation_id, sender_id, content, message_type, media_url, reply_to_message_id, group_id, status
          )
-         SELECT $1, $2, $3,
+         SELECT $1, $2, $3, $4, $5, $6,
                 CASE WHEN c.type = 'group' THEN c.id ELSE NULL END,
                 'sent'
          FROM public.realtime_conversations c
          WHERE c.id = $1
-         RETURNING id, conversation_id, sender_id, content, created_at, status, delivered_at, seen_at`,
-        [conversationId, senderId, content]
+         RETURNING id, conversation_id, sender_id, content, message_type, media_url, reply_to_message_id, reactions, is_pinned, pinned_at, created_at, status, delivered_at, seen_at`,
+        [conversationId, senderId, payload.content || "", payload.messageType, payload.mediaUrl, replyToMessageId]
       );
       if (!result.rows.length) {
         return res.status(404).json({ error: "Conversation not found" });
@@ -449,7 +538,7 @@ function createRealtimeChatModule({
              WHERE cm.conversation_id = m.conversation_id
                AND cm.user_id = $3
            )
-         RETURNING id, conversation_id, sender_id, content, created_at, status, delivered_at, seen_at`,
+         RETURNING id, conversation_id, sender_id, content, message_type, media_url, reply_to_message_id, reactions, is_pinned, pinned_at, created_at, status, delivered_at, seen_at`,
         [messageId, status, actorId]
       );
       if (!result.rows.length) {
@@ -681,10 +770,19 @@ function createRealtimeChatModule({
         return res.status(404).json({ error: "Group not found" });
       }
       const membersResult = await pool.query(
-        `SELECT user_id, role, joined_at
-         FROM public.realtime_conversation_members
-         WHERE conversation_id = $1
-         ORDER BY role DESC, joined_at ASC`,
+        `SELECT m.user_id,
+                m.role,
+                m.joined_at,
+                COALESCE(s.full_name, t.full_name, p.full_name, a.full_name, u.username, m.user_id) AS display_name,
+                COALESCE(s.profile_picture_url, t.profile_picture_url, p.profile_picture_url, a.profile_picture_url, NULL) AS avatar_url
+         FROM public.realtime_conversation_members m
+         LEFT JOIN users u ON LOWER(TRIM(u.email)) = LOWER(TRIM(m.user_id))
+         LEFT JOIN students s ON s.user_id = u.id
+         LEFT JOIN teachers t ON t.user_id = u.id
+         LEFT JOIN parents p ON p.user_id = u.id
+         LEFT JOIN admins a ON a.user_id = u.id
+         WHERE m.conversation_id = $1
+         ORDER BY m.role DESC, m.joined_at ASC`,
         [groupId]
       );
       return res.status(200).json({
@@ -785,6 +883,150 @@ function createRealtimeChatModule({
 
   router.post("/groups/:groupId/messages", async (req, res) => {
     return createMessage(req, res, req.params.groupId);
+  });
+
+  router.post("/messages/:messageId/reaction", async (req, res) => {
+    try {
+      await ensureSchema();
+      const messageId = normalizeText(req.params.messageId);
+      const actorId = normalizeText(req.body.actor_id);
+      const emoji = normalizeText(req.body.emoji);
+      assertRequired(messageId, "messageId");
+      assertRequired(actorId, "actor_id");
+      assertRequired(emoji, "emoji");
+
+      const existing = await pool.query(
+        `SELECT m.id, m.reactions
+         FROM public.realtime_messages m
+         WHERE m.id = $1
+           AND EXISTS (
+             SELECT 1
+             FROM public.realtime_conversation_members cm
+             WHERE cm.conversation_id = m.conversation_id
+               AND cm.user_id = $2
+           )
+         LIMIT 1`,
+        [messageId, actorId]
+      );
+      if (!existing.rows.length) {
+        return res.status(404).json({ error: "Message not found or access denied" });
+      }
+
+      const reactions = existing.rows[0].reactions && typeof existing.rows[0].reactions === "object"
+        ? { ...existing.rows[0].reactions }
+        : {};
+
+      if (reactions[actorId] === emoji) {
+        delete reactions[actorId];
+      } else {
+        reactions[actorId] = emoji;
+      }
+
+      const updated = await pool.query(
+        `UPDATE public.realtime_messages
+         SET reactions = $2::jsonb
+         WHERE id = $1
+         RETURNING id, conversation_id, sender_id, content, message_type, media_url, reply_to_message_id, reactions, is_pinned, pinned_at, created_at, status, delivered_at, seen_at`,
+        [messageId, JSON.stringify(reactions)]
+      );
+
+      return res.status(200).json(updated.rows[0]);
+    } catch (e) {
+      return res.status(e.statusCode || 500).json({ error: e.message });
+    }
+  });
+
+  router.delete("/messages/:messageId", async (req, res) => {
+    try {
+      await ensureSchema();
+      const messageId = normalizeText(req.params.messageId);
+      const actorId = normalizeText(req.body.actor_id || req.query.actor_id);
+      assertRequired(messageId, "messageId");
+      assertRequired(actorId, "actor_id");
+
+      const result = await pool.query(
+        `DELETE FROM public.realtime_messages m
+         WHERE m.id = $1
+           AND EXISTS (
+             SELECT 1
+             FROM public.realtime_conversation_members cm
+             WHERE cm.conversation_id = m.conversation_id
+               AND cm.user_id = $2
+               AND (
+                 m.sender_id = $2 OR
+                 cm.role = 'admin'
+               )
+           )
+         RETURNING id`,
+        [messageId, actorId]
+      );
+
+      if (!result.rows.length) {
+        return res.status(404).json({ error: "Message not found or delete not allowed" });
+      }
+
+      return res.status(200).json({ success: true, id: messageId });
+    } catch (e) {
+      return res.status(e.statusCode || 500).json({ error: e.message });
+    }
+  });
+
+  router.patch("/messages/:messageId/pin", async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await ensureSchema();
+      const messageId = normalizeText(req.params.messageId);
+      const actorId = normalizeText(req.body.actor_id);
+      const isPinned = req.body.is_pinned === true;
+      assertRequired(messageId, "messageId");
+      assertRequired(actorId, "actor_id");
+
+      const messageResult = await client.query(
+        `SELECT m.id, m.conversation_id, m.sender_id, cm.role
+         FROM public.realtime_messages m
+         JOIN public.realtime_conversation_members cm
+           ON cm.conversation_id = m.conversation_id
+         WHERE m.id = $1
+           AND cm.user_id = $2
+         LIMIT 1`,
+        [messageId, actorId]
+      );
+      if (!messageResult.rows.length) {
+        return res.status(404).json({ error: "Message not found or access denied" });
+      }
+
+      const target = messageResult.rows[0];
+      if (target.sender_id !== actorId && target.role !== "admin") {
+        return res.status(403).json({ error: "Only the sender or a group admin can pin this message" });
+      }
+
+      await client.query("BEGIN");
+      if (isPinned) {
+        await client.query(
+          `UPDATE public.realtime_messages
+           SET is_pinned = false,
+               pinned_at = NULL
+           WHERE conversation_id = $1`,
+          [target.conversation_id]
+        );
+      }
+
+      const updated = await client.query(
+        `UPDATE public.realtime_messages
+         SET is_pinned = $2,
+             pinned_at = CASE WHEN $2 THEN CURRENT_TIMESTAMP ELSE NULL END
+         WHERE id = $1
+         RETURNING id, conversation_id, sender_id, content, message_type, media_url, reply_to_message_id, reactions, is_pinned, pinned_at, created_at, status, delivered_at, seen_at`,
+        [messageId, isPinned]
+      );
+      await client.query("COMMIT");
+      return res.status(200).json(updated.rows[0]);
+    } catch (e) {
+      await client.query("ROLLBACK");
+      return res.status(e.statusCode || 500).json({ error: e.message });
+    } finally {
+      client.release();
+    }
   });
 
   return router;
